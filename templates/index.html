@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Trading Bot — Admin Dashboard</title>
+    <!-- Google Fonts & Icons -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <!-- Chart.js -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <div class="app-container">
+        <!-- Header -->
+        <header class="navbar">
+            <div class="logo">
+                <i class="fa-solid fa-robot logo-icon"></i>
+                <div class="logo-text">
+                    <h1>AI Quant Dashboard</h1>
+                    <span class="sub">Automated Paper Trading Engine</span>
+                </div>
+            </div>
+
+            <div class="nav-badges">
+                <div class="badge mode-badge" id="mode-badge">
+                    <i class="fa-solid fa-shield-halved"></i> <span>Paper Trading</span>
+                </div>
+                <div class="badge market-badge" id="market-badge">
+                    <i class="fa-solid fa-circle-dot"></i> <span id="market-status">Checking...</span>
+                </div>
+                <div class="badge status-badge" id="kill-switch-badge">
+                    <i class="fa-solid fa-circle-check"></i> <span id="system-status">System Normal</span>
+                </div>
+            </div>
+
+            <div class="nav-actions">
+                <button class="btn btn-secondary" onclick="fetchData()">
+                    <i class="fa-solid fa-rotate"></i> Refresh
+                </button>
+                <button class="btn btn-danger" id="kill-switch-btn" onclick="toggleKillSwitch()">
+                    <i class="fa-solid fa-power-off"></i> Kill Switch
+                </button>
+            </div>
+        </header>
+
+        <!-- Main Content -->
+        <main class="dashboard-grid">
+
+            <!-- KPI Cards Row -->
+            <section class="kpi-row">
+                <div class="kpi-card">
+                    <div class="kpi-icon blue"><i class="fa-solid fa-wallet"></i></div>
+                    <div class="kpi-info">
+                        <span class="kpi-label">Portfolio Equity</span>
+                        <h2 class="kpi-value" id="equity-val">$0.00</h2>
+                        <span class="kpi-sub" id="equity-sub">Prev: $0.00</span>
+                    </div>
+                </div>
+
+                <div class="kpi-card">
+                    <div class="kpi-icon" id="pl-icon-bg"><i class="fa-solid fa-chart-line" id="pl-icon"></i></div>
+                    <div class="kpi-info">
+                        <span class="kpi-label">Daily P&L</span>
+                        <h2 class="kpi-value" id="daily-pl-val">$0.00</h2>
+                        <span class="kpi-badge" id="daily-pl-pct">0.00%</span>
+                    </div>
+                </div>
+
+                <div class="kpi-card">
+                    <div class="kpi-icon green"><i class="fa-solid fa-bolt"></i></div>
+                    <div class="kpi-info">
+                        <span class="kpi-label">Buying Power</span>
+                        <h2 class="kpi-value" id="buying-power-val">$0.00</h2>
+                        <span class="kpi-sub" id="cash-val">Cash: $0.00</span>
+                    </div>
+                </div>
+
+                <div class="kpi-card">
+                    <div class="kpi-icon purple"><i class="fa-solid fa-layer-group"></i></div>
+                    <div class="kpi-info">
+                        <span class="kpi-label">Active Positions</span>
+                        <h2 class="kpi-value" id="positions-count">0</h2>
+                        <span class="kpi-sub">Universe: SPY, QQQ, AAPL, MSFT, GOOGL</span>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Charts Section -->
+            <section class="charts-grid">
+                <div class="panel chart-panel">
+                    <div class="panel-header">
+                        <h3><i class="fa-solid fa-chart-area"></i> Equity Tracker (Live)</h3>
+                        <span class="timestamp-label" id="last-updated">Updating...</span>
+                    </div>
+                    <div class="chart-container">
+                        <canvas id="equityChart"></canvas>
+                    </div>
+                </div>
+
+                <div class="panel chart-panel doughnut-panel">
+                    <div class="panel-header">
+                        <h3><i class="fa-solid fa-chart-pie"></i> Asset Allocation</h3>
+                    </div>
+                    <div class="chart-container">
+                        <canvas id="allocationChart"></canvas>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Strategy Scanner Grid -->
+            <section class="panel">
+                <div class="panel-header">
+                    <h3><i class="fa-solid fa-radar"></i> Strategy Scanner (Mean Reversion & Smart DCA)</h3>
+                    <span class="tag">5-Min Scan Cycle</span>
+                </div>
+                <div class="scanner-grid" id="scanner-container">
+                    <div class="loading-state"><i class="fa-solid fa-spinner fa-spin"></i> Loading Stock Indicators...</div>
+                </div>
+            </section>
+
+            <!-- Open Positions Table -->
+            <section class="panel">
+                <div class="panel-header">
+                    <h3><i class="fa-solid fa-list-check"></i> Open Positions & Active Orders</h3>
+                    <span class="count-tag" id="table-count-tag">0 Positions</span>
+                </div>
+                <div class="table-responsive">
+                    <table class="data-table">
+                        <thead>
+                            <tr>
+                                <th>Symbol</th>
+                                <th>Qty</th>
+                                <th>Avg Entry</th>
+                                <th>Current Price</th>
+                                <th>Market Value</th>
+                                <th>Stop-Loss Target</th>
+                                <th>Take-Profit Target</th>
+                                <th>Unrealized P&L</th>
+                                <th>Action</th>
+                            </tr>
+                        </thead>
+                        <tbody id="positions-tbody">
+                            <tr>
+                                <td colspan="9" class="empty-state">No open positions currently held. Bot is scanning for entry dips...</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </section>
+
+            <!-- Live Bot Log Terminal -->
+            <section class="panel log-panel">
+                <div class="panel-header">
+                    <h3><i class="fa-solid fa-terminal"></i> Bot Execution Log</h3>
+                    <button class="btn-text" onclick="fetchLogs()"><i class="fa-solid fa-rotate-right"></i> Refresh Log</button>
+                </div>
+                <div class="log-terminal" id="log-terminal">
+                    <div class="log-line info">Initialising dashboard stream...</div>
+                </div>
+            </section>
+
+        </main>
+    </div>
+
+    <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>

@@ -1,0 +1,10 @@
+# Automated AI Stock Trading Bot — Dependencies
+# Install: pip install -r requirements.txt
+
+alpaca-py>=0.21.0          # Official Alpaca SDK (Trading + Market Data)
+pandas>=2.0.0              # Data manipulation & analysis
+numpy>=1.24.0              # Numerical computations (also used for TA indicators)
+python-dotenv>=1.0.0       # Secure .env credential loading
+tzdata>=2024.1             # Timezone database (required on Windows for zoneinfo)
+flask>=3.0.0               # Web server for Admin Dashboard
+flask-cors>=4.0.0          # CORS support for Web Dashboard API
