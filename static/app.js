@@ -97,11 +97,13 @@ async function fetchIndiaData() {
 
         if (statusRes.ok) {
             const status = await statusRes.json();
-            if (status.status === "disabled") {
-                renderIndiaDisabledState();
+            if (status.status === "disabled" || status.status === "error") {
+                renderIndiaDisabledState(status.message);
                 return;
             }
             updateIndiaStatusUI(status);
+        } else {
+            renderIndiaDisabledState("Add Angel One keys in Render Environment");
         }
 
         if (positionsRes.ok) {
@@ -116,6 +118,7 @@ async function fetchIndiaData() {
 
     } catch (err) {
         console.error("Error fetching India dashboard data:", err);
+        renderIndiaDisabledState("Add Angel One keys in Render Environment");
     }
 }
 
@@ -272,9 +275,19 @@ function updateCombinedStatusUI(data) {
     marketStatusEl.textContent = "Dual Market Active";
 }
 
-function renderIndiaDisabledState() {
-    document.getElementById("equity-val").textContent = "Disabled";
-    document.getElementById("equity-sub").textContent = "Add Angel One credentials to .env";
+function renderIndiaDisabledState(msg) {
+    document.getElementById("equity-val").textContent = "Angel One Pending";
+    document.getElementById("equity-sub").textContent = msg || "Add Angel One credentials to Render Environment";
+    document.getElementById("daily-pl-val").textContent = "₹0.00";
+    document.getElementById("daily-pl-pct").textContent = "0.00%";
+    document.getElementById("buying-power-val").textContent = "₹0.00";
+    document.getElementById("cash-val").textContent = "Cash: ₹0.00";
+    
+    const marketStatusEl = document.getElementById("market-status");
+    const marketBadge = document.getElementById("market-badge");
+    marketStatusEl.textContent = "Angel One Keys Needed";
+    marketBadge.style.color = "var(--warning)";
+    marketBadge.style.background = "var(--warning-bg)";
 }
 
 /* ── Update Positions Table ────────────────────────────────────────────── */
