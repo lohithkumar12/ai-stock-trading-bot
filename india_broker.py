@@ -53,6 +53,7 @@ class IndiaBroker:
         self.feed_token = None
         self._session_time = None
         self._logged_in = False
+        self.last_error = ""
 
         # Attempt login on initialization
         self.login()
@@ -71,8 +72,14 @@ class IndiaBroker:
             True if login succeeded, False otherwise.
         """
         try:
-            # Generate fresh TOTP
-            totp = pyotp.TOTP(self.totp_secret).now()
+            if not self.totp_secret or not self.client_id or not self.pin:
+                self.last_error = "Missing Angel One credentials in Environment"
+                self._logged_in = False
+                return False
+
+            # Clean spaces from TOTP secret if user pasted with spaces
+            clean_secret = self.totp_secret.replace(" ", "").upper()
+            totp = pyotp.TOTP(clean_secret).now()
 
             # Login
             session_data = self.smart_api.generateSession(
@@ -84,6 +91,7 @@ class IndiaBroker:
                 self.feed_token = session_data["data"].get("feedToken")
                 self._session_time = datetime.now()
                 self._logged_in = True
+                self.last_error = ""
 
                 logger.info(
                     f"Angel One LOGIN SUCCESS | Client: {self.client_id} | "
@@ -91,12 +99,15 @@ class IndiaBroker:
                 )
                 return True
             else:
-                msg = session_data.get("message", "Unknown error") if session_data else "No response"
+                msg = session_data.get("message", "Unknown login error") if session_data else "No response from Angel One"
+                self.last_error = msg
                 logger.error(f"Angel One LOGIN FAILED: {msg}")
                 self._logged_in = False
                 return False
 
         except Exception as e:
+            err_msg = str(e)
+            self.last_error = f"Login Exception: {err_msg}"
             logger.error(f"Angel One LOGIN ERROR: {e}", exc_info=True)
             self._logged_in = False
             return False
@@ -104,15 +115,11 @@ class IndiaBroker:
     def ensure_session(self):
         """
         Check if session is still valid, re-login if expired.
-
-        Angel One sessions expire after ~24 hours. This method
-        is called before every API call to ensure connectivity.
         """
         if not self._logged_in:
             self.login()
             return
 
-        # Re-login if session is older than 12 hours (safety margin)
         if self._session_time:
             elapsed = datetime.now() - self._session_time
             if elapsed > timedelta(hours=12):
@@ -129,17 +136,12 @@ class IndiaBroker:
     def get_account_info(self) -> dict | None:
         """
         Get Angel One account margin and fund information.
-
-        Returns:
-            Dict with keys: equity, available_cash, used_margin
-            Returns None on failure.
         """
         self.ensure_session()
         try:
             rms_data = self.smart_api.rmsLimit()
             if rms_data and rms_data.get("status"):
                 data = rms_data["data"]
-                # Angel One returns various margin fields
                 net = float(data.get("net", 0))
                 available_cash = float(data.get("availablecash", 0))
                 used_margin = float(data.get("utiliseddebits", 0))
@@ -157,10 +159,12 @@ class IndiaBroker:
                 return info
             else:
                 msg = rms_data.get("message", "Unknown") if rms_data else "No response"
+                self.last_error = f"Account limit error: {msg}"
                 logger.error(f"Failed to fetch Angel One account info: {msg}")
                 return None
 
         except Exception as e:
+            self.last_error = f"RMS Error: {e}"
             logger.error(f"Angel One account info error: {e}", exc_info=True)
             return None
 
@@ -168,17 +172,6 @@ class IndiaBroker:
     # Historical Data
     # -----------------------------------------------------------------------
     def get_historical_bars(self, symbol: str, days: int = 300) -> pd.DataFrame | None:
-        """
-        Fetch historical OHLCV candle data for an NSE stock.
-
-        Args:
-            symbol: Stock symbol (e.g., "RELIANCE")
-            days:   Number of days of history to fetch
-
-        Returns:
-            DataFrame with columns: open, high, low, close, volume
-            Returns None on failure.
-        """
         self.ensure_session()
         token = get_token(symbol)
         exchange = get_exchange(symbol)
@@ -230,16 +223,6 @@ class IndiaBroker:
     # Real-time Quote (LTP)
     # -----------------------------------------------------------------------
     def get_latest_quote(self, symbol: str) -> dict | None:
-        """
-        Get the latest traded price (LTP) for an NSE stock.
-
-        Args:
-            symbol: Stock symbol (e.g., "RELIANCE")
-
-        Returns:
-            Dict with keys: ltp, symbol, exchange
-            Returns None on failure.
-        """
         self.ensure_session()
         token = get_token(symbol)
         trading_symbol = get_trading_symbol(symbol)
@@ -258,7 +241,7 @@ class IndiaBroker:
 
                 return {
                     "ltp": ltp,
-                    "ask_price": ltp,  # Use LTP as ask price approximation
+                    "ask_price": ltp,
                     "symbol": symbol,
                     "exchange": exchange,
                 }
@@ -275,12 +258,6 @@ class IndiaBroker:
     # Position Tracking
     # -----------------------------------------------------------------------
     def get_open_positions(self) -> dict:
-        """
-        Get all currently held positions from Angel One.
-
-        Returns:
-            Dict of {symbol: position_data} matching US bot format.
-        """
         self.ensure_session()
         try:
             position_data = self.smart_api.position()
@@ -295,13 +272,11 @@ class IndiaBroker:
 
             pos_dict = {}
             for pos in positions:
-                # Only track net open positions (quantity != 0)
                 net_qty = int(pos.get("netqty", 0))
                 if net_qty == 0:
                     continue
 
                 symbol_raw = pos.get("tradingsymbol", "")
-                # Strip "-EQ" suffix for display
                 symbol = symbol_raw.replace("-EQ", "")
 
                 buy_price = float(pos.get("averageprice", 0))
@@ -338,20 +313,6 @@ class IndiaBroker:
         qty: int,
         limit_price: float,
     ) -> str | None:
-        """
-        Place a LIMIT BUY order for an NSE stock.
-
-        Uses NORMAL variety with CNC (Cash & Carry / Delivery) product type
-        for investment-style holding (not intraday).
-
-        Args:
-            symbol:      Stock symbol (e.g., "RELIANCE")
-            qty:         Number of shares to buy
-            limit_price: Limit price for the order
-
-        Returns:
-            Order ID string if successful, None otherwise.
-        """
         self.ensure_session()
         token = get_token(symbol)
         trading_symbol = get_trading_symbol(symbol)
@@ -369,7 +330,7 @@ class IndiaBroker:
                 "transactiontype": "BUY",
                 "exchange": exchange,
                 "ordertype": "LIMIT",
-                "producttype": "CNC",  # Cash & Carry (Delivery)
+                "producttype": "CNC",
                 "duration": "DAY",
                 "price": str(round(limit_price, 2)),
                 "quantity": str(qty),
@@ -395,18 +356,6 @@ class IndiaBroker:
         limit_price: float = 0,
         order_type: str = "MARKET",
     ) -> str | None:
-        """
-        Place a SELL order to close a position.
-
-        Args:
-            symbol:      Stock symbol
-            qty:         Number of shares to sell
-            limit_price: Limit price (0 for market order)
-            order_type:  "MARKET" or "LIMIT"
-
-        Returns:
-            Order ID string if successful, None otherwise.
-        """
         self.ensure_session()
         token = get_token(symbol)
         trading_symbol = get_trading_symbol(symbol)
@@ -445,19 +394,7 @@ class IndiaBroker:
             logger.error(f"Failed to place SELL order for {symbol}: {e}", exc_info=True)
             return None
 
-    # -----------------------------------------------------------------------
-    # Position Closing (convenience wrapper)
-    # -----------------------------------------------------------------------
     def close_position(self, symbol: str) -> bool:
-        """
-        Close an open position by selling all shares at market price.
-
-        Args:
-            symbol: Stock symbol to close
-
-        Returns:
-            True if sell order placed successfully, False otherwise.
-        """
         positions = self.get_open_positions()
         if symbol not in positions:
             logger.warning(f"{symbol}: No open position to close")
@@ -471,23 +408,7 @@ class IndiaBroker:
             return True
         return False
 
-    # -----------------------------------------------------------------------
-    # Stop-Loss / Take-Profit Monitoring
-    # -----------------------------------------------------------------------
     def check_sl_tp(self, risk_mgr) -> list[str]:
-        """
-        Manually check stop-loss and take-profit levels for all India positions.
-
-        Since Angel One doesn't always support bracket orders for all stocks,
-        this method checks each position against SL/TP thresholds and closes
-        positions that have hit their exit levels.
-
-        Args:
-            risk_mgr: RiskManager instance (shared with US bot)
-
-        Returns:
-            List of symbols that were closed due to SL/TP triggers.
-        """
         closed_symbols = []
         positions = self.get_open_positions()
 
@@ -498,7 +419,6 @@ class IndiaBroker:
             sl_price = risk_mgr.get_stop_loss_price(entry_price)
             tp_price = risk_mgr.get_take_profit_price(entry_price)
 
-            # Stop-loss triggered
             if current_price <= sl_price:
                 logger.warning(
                     f"[INDIA SL] {symbol} hit stop-loss! "
@@ -507,7 +427,6 @@ class IndiaBroker:
                 if self.close_position(symbol):
                     closed_symbols.append(symbol)
 
-            # Take-profit triggered
             elif current_price >= tp_price:
                 logger.info(
                     f"[INDIA TP] {symbol} hit take-profit! "
@@ -518,16 +437,12 @@ class IndiaBroker:
 
         return closed_symbols
 
-    # -----------------------------------------------------------------------
-    # Order Cancellation
-    # -----------------------------------------------------------------------
     def cancel_all_open_orders(self) -> bool:
-        """Cancel all pending orders on Angel One."""
         self.ensure_session()
         try:
             order_book = self.smart_api.orderBook()
             if not order_book or not order_book.get("status"):
-                return True  # No orders to cancel
+                return True
 
             orders = order_book.get("data", [])
             if not orders:
@@ -553,11 +468,7 @@ class IndiaBroker:
             logger.error(f"Angel One cancel orders error: {e}", exc_info=True)
             return False
 
-    # -----------------------------------------------------------------------
-    # Logout
-    # -----------------------------------------------------------------------
     def logout(self):
-        """Logout from Angel One SmartAPI."""
         try:
             self.smart_api.terminateSession(self.client_id)
             self._logged_in = False

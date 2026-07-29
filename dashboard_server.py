@@ -123,7 +123,6 @@ def get_status():
         "daily_pl_pct": round(daily_pl_pct, 2),
         "kill_switch_active": risk_mgr.is_kill_switch_active if risk_mgr else False,
         "market_open": market_open,
-        "equity_history": _equity_history,
         "india_enabled": config.INDIA_ENABLED
     })
 
@@ -208,34 +207,34 @@ def get_india_status():
     if not config.INDIA_ENABLED:
         return jsonify({
             "status": "disabled",
-            "message": "India trading not configured. Add Angel One credentials to .env"
+            "message": "India trading disabled. Add ANGEL_API_KEY, ANGEL_CLIENT_ID, ANGEL_PIN, ANGEL_TOTP_SECRET to Render Environment Variables."
         })
 
     india_broker, _ = get_india_components()
     if not india_broker or not india_broker.is_logged_in:
+        err_msg = india_broker.last_error if (india_broker and india_broker.last_error) else "Angel One authentication failed. Verify keys in Render Environment."
         return jsonify({
             "status": "error",
-            "message": "Angel One not connected. Check credentials."
-        }), 500
+            "message": err_msg
+        })
 
     account_info = india_broker.get_account_info()
     if not account_info:
+        err_msg = india_broker.last_error if india_broker.last_error else "Unable to fetch Angel One account info."
         return jsonify({
             "status": "error",
-            "message": "Unable to fetch Angel One account info."
-        }), 500
+            "message": err_msg
+        })
 
     equity = account_info["equity"]
     cash = account_info["available_cash"]
 
-    # Track equity history for India
     now_str = datetime.now(timezone.utc).strftime("%H:%M:%S")
     if not _india_equity_history or _india_equity_history[-1]["timestamp"] != now_str:
         _india_equity_history.append({"timestamp": now_str, "equity": round(equity, 2)})
         if len(_india_equity_history) > 60:
             _india_equity_history.pop(0)
 
-    # India market hours: 9:15 AM - 3:30 PM IST
     try:
         from zoneinfo import ZoneInfo
         IST = ZoneInfo("Asia/Kolkata")
@@ -263,12 +262,11 @@ def get_india_status():
 
 @app.route("/api/india/positions")
 def get_india_positions():
-    """Get open positions from Angel One."""
     if not config.INDIA_ENABLED:
         return jsonify([])
 
     india_broker, _ = get_india_components()
-    if not india_broker:
+    if not india_broker or not india_broker.is_logged_in:
         return jsonify([])
 
     positions_dict = india_broker.get_open_positions()
@@ -298,12 +296,11 @@ def get_india_positions():
 
 @app.route("/api/india/scanner")
 def get_india_scanner():
-    """Scan India stocks for trading signals."""
     if not config.INDIA_ENABLED:
         return jsonify([])
 
     india_broker, strategy = get_india_components()
-    if not india_broker or not strategy:
+    if not india_broker or not india_broker.is_logged_in or not strategy:
         return jsonify([])
 
     scanner_results = []
@@ -344,7 +341,6 @@ def get_india_scanner():
 
 @app.route("/api/india/close_position/<symbol>", methods=["POST"])
 def close_india_position(symbol):
-    """Close an India market position."""
     india_broker, _ = get_india_components()
     if not india_broker:
         return jsonify({"status": "error", "message": "India broker not available"}), 500
@@ -361,7 +357,6 @@ def close_india_position(symbol):
 # ===========================================================================
 @app.route("/api/combined/status")
 def get_combined_status():
-    """Get combined KPIs from both US and India markets."""
     result = {
         "us": None,
         "india": None,
@@ -369,7 +364,6 @@ def get_combined_status():
         "india_enabled": config.INDIA_ENABLED,
     }
 
-    # US data
     executor, _, _, risk_mgr = get_components()
     if executor:
         us_account = executor.get_account_info()
@@ -381,7 +375,6 @@ def get_combined_status():
             }
             result["combined_equity"] += us_account["equity"]
 
-    # India data
     if config.INDIA_ENABLED:
         india_broker, _ = get_india_components()
         if india_broker and india_broker.is_logged_in:
@@ -396,9 +389,6 @@ def get_combined_status():
     return jsonify(result)
 
 
-# ===========================================================================
-# Shared Endpoints
-# ===========================================================================
 def pd_isna(val):
     import pandas as pd
     return pd.isna(val)
