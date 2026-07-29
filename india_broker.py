@@ -54,6 +54,7 @@ class IndiaBroker:
         self._session_time = None
         self._logged_in = False
         self.last_error = ""
+        self._last_candle_call_time = 0
 
         # Attempt login on initialization
         self.login()
@@ -62,26 +63,15 @@ class IndiaBroker:
     # Authentication
     # -----------------------------------------------------------------------
     def login(self) -> bool:
-        """
-        Login to Angel One SmartAPI using TOTP auto-generation.
-
-        Generates a fresh TOTP from the secret key, then calls
-        generateSession() to obtain JWT auth token.
-
-        Returns:
-            True if login succeeded, False otherwise.
-        """
         try:
             if not self.totp_secret or not self.client_id or not self.pin:
                 self.last_error = "Missing Angel One credentials in Environment"
                 self._logged_in = False
                 return False
 
-            # Clean spaces from TOTP secret if user pasted with spaces
             clean_secret = self.totp_secret.replace(" ", "").upper()
             totp = pyotp.TOTP(clean_secret).now()
 
-            # Login
             session_data = self.smart_api.generateSession(
                 self.client_id, self.pin, totp
             )
@@ -113,9 +103,6 @@ class IndiaBroker:
             return False
 
     def ensure_session(self):
-        """
-        Check if session is still valid, re-login if expired.
-        """
         if not self._logged_in:
             self.login()
             return
@@ -134,17 +121,14 @@ class IndiaBroker:
     # Account Information
     # -----------------------------------------------------------------------
     def get_account_info(self) -> dict | None:
-        """
-        Get Angel One account margin and fund information.
-        """
         self.ensure_session()
         try:
             rms_data = self.smart_api.rmsLimit()
             if rms_data and rms_data.get("status"):
                 data = rms_data["data"]
-                net = float(data.get("net", 0))
-                available_cash = float(data.get("availablecash", 0))
-                used_margin = float(data.get("utiliseddebits", 0))
+                net = float(data.get("net", 0) or 0)
+                available_cash = float(data.get("availablecash", 0) or 0)
+                used_margin = float(data.get("utiliseddebits", 0) or 0)
 
                 info = {
                     "equity": net if net > 0 else available_cash,
@@ -169,7 +153,7 @@ class IndiaBroker:
             return None
 
     # -----------------------------------------------------------------------
-    # Historical Data
+    # Historical Data (with Rate-Limiting Protection)
     # -----------------------------------------------------------------------
     def get_historical_bars(self, symbol: str, days: int = 300) -> pd.DataFrame | None:
         self.ensure_session()
@@ -179,6 +163,13 @@ class IndiaBroker:
         if not token:
             logger.error(f"No instrument token found for {symbol}")
             return None
+
+        # Rate-limiting: Angel One permits max 3 calls/sec (delay 350ms between calls)
+        now_ts = time.time()
+        time_since_last = now_ts - self._last_candle_call_time
+        if time_since_last < 0.35:
+            time.sleep(0.35 - time_since_last)
+        self._last_candle_call_time = time.time()
 
         try:
             to_date = datetime.now()
