@@ -1,10 +1,14 @@
 """
-dashboard_server.py — Web Admin Dashboard Backend
-===================================================
-Provides a REST API and Web Interface to view real-time trading stats,
-portfolio equity, P&L, active positions, strategy signals, and bot logs.
+dashboard_server.py — Unified Web Admin Dashboard Backend
+=============================================================
+Provides REST API and Web Interface for both US (Alpaca) and
+India (Angel One) trading bots.
 
-Supports cloud deployment (Render, Heroku) by reading PORT from env.
+Supports:
+  - US market endpoints (existing)
+  - India market endpoints (new)
+  - Combined market view
+  - Cloud deployment (Render, Heroku) via PORT env var
 """
 
 import logging
@@ -26,14 +30,21 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__, template_folder="templates", static_folder="static")
 CORS(app)
 
+# US components
 _executor = None
 _data_feed = None
 _strategy = None
 _risk_mgr = None
 _equity_history = []
 
+# India components
+_india_broker = None
+_india_strategy = None
+_india_equity_history = []
+
 
 def get_components():
+    """Initialize US market components (Alpaca)."""
     global _executor, _data_feed, _strategy, _risk_mgr
     if _executor is None:
         try:
@@ -42,15 +53,37 @@ def get_components():
             _strategy = Strategy()
             _risk_mgr = RiskManager()
         except Exception as e:
-            logger.error(f"Error initializing dashboard components: {e}")
+            logger.error(f"Error initializing US dashboard components: {e}")
     return _executor, _data_feed, _strategy, _risk_mgr
 
 
+def get_india_components():
+    """Initialize India market components (Angel One)."""
+    global _india_broker, _india_strategy
+    if not config.INDIA_ENABLED:
+        return None, None
+
+    if _india_broker is None:
+        try:
+            from india_broker import IndiaBroker
+            _india_broker = IndiaBroker()
+            _india_strategy = Strategy()  # Same strategy engine
+        except Exception as e:
+            logger.error(f"Error initializing India dashboard components: {e}")
+    return _india_broker, _india_strategy
+
+
+# ===========================================================================
+# Web Page Route
+# ===========================================================================
 @app.route("/")
 def index():
     return render_template("index.html")
 
 
+# ===========================================================================
+# US Market API Endpoints (Existing)
+# ===========================================================================
 @app.route("/api/status")
 def get_status():
     executor, _, _, risk_mgr = get_components()
@@ -90,7 +123,8 @@ def get_status():
         "daily_pl_pct": round(daily_pl_pct, 2),
         "kill_switch_active": risk_mgr.is_kill_switch_active if risk_mgr else False,
         "market_open": market_open,
-        "equity_history": _equity_history
+        "equity_history": _equity_history,
+        "india_enabled": config.INDIA_ENABLED
     })
 
 
@@ -165,6 +199,206 @@ def get_scanner():
     return jsonify(scanner_results)
 
 
+# ===========================================================================
+# India Market API Endpoints (New)
+# ===========================================================================
+@app.route("/api/india/status")
+def get_india_status():
+    """Get India market account status from Angel One."""
+    if not config.INDIA_ENABLED:
+        return jsonify({
+            "status": "disabled",
+            "message": "India trading not configured. Add Angel One credentials to .env"
+        })
+
+    india_broker, _ = get_india_components()
+    if not india_broker or not india_broker.is_logged_in:
+        return jsonify({
+            "status": "error",
+            "message": "Angel One not connected. Check credentials."
+        }), 500
+
+    account_info = india_broker.get_account_info()
+    if not account_info:
+        return jsonify({
+            "status": "error",
+            "message": "Unable to fetch Angel One account info."
+        }), 500
+
+    equity = account_info["equity"]
+    cash = account_info["available_cash"]
+
+    # Track equity history for India
+    now_str = datetime.now(timezone.utc).strftime("%H:%M:%S")
+    if not _india_equity_history or _india_equity_history[-1]["timestamp"] != now_str:
+        _india_equity_history.append({"timestamp": now_str, "equity": round(equity, 2)})
+        if len(_india_equity_history) > 60:
+            _india_equity_history.pop(0)
+
+    # India market hours: 9:15 AM - 3:30 PM IST
+    try:
+        from zoneinfo import ZoneInfo
+        IST = ZoneInfo("Asia/Kolkata")
+    except ImportError:
+        import pytz
+        IST = pytz.timezone("Asia/Kolkata")
+
+    now_ist = datetime.now(IST)
+    is_weekday = now_ist.weekday() < 5
+    market_open_time = now_ist.replace(hour=9, minute=15, second=0, microsecond=0)
+    market_close_time = now_ist.replace(hour=15, minute=30, second=0, microsecond=0)
+    india_market_open = is_weekday and market_open_time <= now_ist <= market_close_time
+
+    return jsonify({
+        "status": "success",
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "equity": equity,
+        "available_cash": cash,
+        "used_margin": account_info["used_margin"],
+        "market_open": india_market_open,
+        "logged_in": india_broker.is_logged_in,
+        "equity_history": _india_equity_history
+    })
+
+
+@app.route("/api/india/positions")
+def get_india_positions():
+    """Get open positions from Angel One."""
+    if not config.INDIA_ENABLED:
+        return jsonify([])
+
+    india_broker, _ = get_india_components()
+    if not india_broker:
+        return jsonify([])
+
+    positions_dict = india_broker.get_open_positions()
+    positions_list = []
+
+    _, _, _, risk_mgr = get_components()
+
+    for symbol, pos in positions_dict.items():
+        entry_price = pos["avg_entry_price"]
+        sl_price = risk_mgr.get_stop_loss_price(entry_price) if risk_mgr else round(entry_price * 0.98, 2)
+        tp_price = risk_mgr.get_take_profit_price(entry_price) if risk_mgr else round(entry_price * 1.04, 2)
+
+        positions_list.append({
+            "symbol": symbol,
+            "qty": pos["qty"],
+            "avg_entry_price": entry_price,
+            "current_price": pos["current_price"],
+            "market_value": pos["market_value"],
+            "unrealized_pl": pos["unrealized_pl"],
+            "unrealized_plpc": round(pos["unrealized_plpc"] * 100, 2),
+            "stop_loss": sl_price,
+            "take_profit": tp_price
+        })
+
+    return jsonify(positions_list)
+
+
+@app.route("/api/india/scanner")
+def get_india_scanner():
+    """Scan India stocks for trading signals."""
+    if not config.INDIA_ENABLED:
+        return jsonify([])
+
+    india_broker, strategy = get_india_components()
+    if not india_broker or not strategy:
+        return jsonify([])
+
+    scanner_results = []
+    for symbol in config.INDIA_STOCK_UNIVERSE:
+        try:
+            df = india_broker.get_historical_bars(symbol)
+            if df is not None and not df.empty:
+                df = strategy.compute_indicators(df)
+                signal = strategy.generate_signal(df, symbol)
+                latest = df.iloc[-1]
+
+                scanner_results.append({
+                    "symbol": symbol,
+                    "price": round(float(latest["close"]), 2),
+                    "sma_200": round(float(latest[f"SMA_{config.SMA_SLOW}"]), 2) if not pd_isna(latest.get(f"SMA_{config.SMA_SLOW}")) else None,
+                    "sma_20": round(float(latest[f"SMA_{config.SMA_FAST}"]), 2) if not pd_isna(latest.get(f"SMA_{config.SMA_FAST}")) else None,
+                    "rsi": round(float(latest[f"RSI_{config.RSI_PERIOD}"]), 1) if not pd_isna(latest.get(f"RSI_{config.RSI_PERIOD}")) else None,
+                    "bbl": round(float(latest["BBL"]), 2) if not pd_isna(latest.get("BBL")) else None,
+                    "bbu": round(float(latest["BBU"]), 2) if not pd_isna(latest.get("BBU")) else None,
+                    "signal": signal
+                })
+            else:
+                scanner_results.append({
+                    "symbol": symbol,
+                    "price": 0.0,
+                    "signal": "NO_DATA"
+                })
+        except Exception as e:
+            logger.error(f"Error scanning India {symbol}: {e}")
+            scanner_results.append({
+                "symbol": symbol,
+                "price": 0.0,
+                "signal": "ERROR"
+            })
+
+    return jsonify(scanner_results)
+
+
+@app.route("/api/india/close_position/<symbol>", methods=["POST"])
+def close_india_position(symbol):
+    """Close an India market position."""
+    india_broker, _ = get_india_components()
+    if not india_broker:
+        return jsonify({"status": "error", "message": "India broker not available"}), 500
+
+    success = india_broker.close_position(symbol)
+    if success:
+        return jsonify({"status": "success", "message": f"Closed India position for {symbol}"})
+    else:
+        return jsonify({"status": "error", "message": f"Failed to close India position for {symbol}"}), 400
+
+
+# ===========================================================================
+# Combined Market View
+# ===========================================================================
+@app.route("/api/combined/status")
+def get_combined_status():
+    """Get combined KPIs from both US and India markets."""
+    result = {
+        "us": None,
+        "india": None,
+        "combined_equity": 0,
+        "india_enabled": config.INDIA_ENABLED,
+    }
+
+    # US data
+    executor, _, _, risk_mgr = get_components()
+    if executor:
+        us_account = executor.get_account_info()
+        if us_account:
+            result["us"] = {
+                "equity": us_account["equity"],
+                "daily_pl": round(us_account["equity"] - us_account["last_equity"], 2),
+                "cash": us_account["cash"],
+            }
+            result["combined_equity"] += us_account["equity"]
+
+    # India data
+    if config.INDIA_ENABLED:
+        india_broker, _ = get_india_components()
+        if india_broker and india_broker.is_logged_in:
+            india_account = india_broker.get_account_info()
+            if india_account:
+                result["india"] = {
+                    "equity": india_account["equity"],
+                    "available_cash": india_account["available_cash"],
+                }
+                result["combined_equity"] += india_account["equity"]
+
+    return jsonify(result)
+
+
+# ===========================================================================
+# Shared Endpoints
+# ===========================================================================
 def pd_isna(val):
     import pandas as pd
     return pd.isna(val)

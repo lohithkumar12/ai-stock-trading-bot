@@ -3,8 +3,12 @@
 
 alpaca-py>=0.21.0          # Official Alpaca SDK (Trading + Market Data)
 pandas>=2.0.0              # Data manipulation & analysis
-numpy>=1.24.0              # Numerical computations (also used for TA indicators)
-python-dotenv>=1.0.0       # Secure .env credential loading
-tzdata>=2024.1             # Timezone database (required on Windows for zoneinfo)
-flask>=3.0.0               # Web server for Admin Dashboard
-flask-cors>=4.0.0          # CORS support for Web Dashboard API
+numpy>=1.24.0              # Numerical computations
+python-dotenv>=1.0.0       # .env file loader
+flask>=3.0.0               # Web dashboard backend
+flask-cors>=4.0.0          # CORS for frontend API calls
+
+# ── Indian Market (Angel One SmartAPI) ──
+smartapi-python>=1.3.0     # Angel One SmartAPI SDK
+pyotp>=2.9.0               # TOTP generator for Angel One auto-login
+logzero>=1.7.0             # Logger dependency for SmartApi

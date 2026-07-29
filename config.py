@@ -10,6 +10,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# ===========================================================================
+# US Market — Alpaca Paper Trading API Credentials
+# ===========================================================================
 ALPACA_API_KEY: str = os.getenv("ALPACA_API_KEY", "").strip()
 ALPACA_SECRET_KEY: str = os.getenv("ALPACA_SECRET_KEY", "").strip()
 BASE_URL: str = os.getenv("BASE_URL", "https://paper-api.alpaca.markets").strip()
@@ -24,7 +27,7 @@ PAPER_TRADING: bool = True
 TEST_MODE: bool = False
 
 # ---------------------------------------------------------------------------
-# Expanded Stock Universe — Top Liquid Large-Cap Stocks & ETFs
+# US Stock Universe — Top Liquid Large-Cap Stocks & ETFs
 # ---------------------------------------------------------------------------
 STOCK_UNIVERSE: list[str] = [
     "SPY",    # S&P 500 ETF
@@ -41,6 +44,40 @@ STOCK_UNIVERSE: list[str] = [
     "LLY",    # Eli Lilly
 ]
 
+# ===========================================================================
+# India Market — Angel One SmartAPI Credentials
+# ===========================================================================
+ANGEL_API_KEY: str = os.getenv("ANGEL_API_KEY", "").strip()
+ANGEL_CLIENT_ID: str = os.getenv("ANGEL_CLIENT_ID", "").strip()
+ANGEL_PIN: str = os.getenv("ANGEL_PIN", "").strip()
+ANGEL_TOTP_SECRET: str = os.getenv("ANGEL_TOTP_SECRET", "").strip()
+
+# Auto-detect if India trading is configured
+INDIA_ENABLED: bool = bool(
+    ANGEL_API_KEY and ANGEL_CLIENT_ID and ANGEL_PIN and ANGEL_TOTP_SECRET
+)
+
+# ---------------------------------------------------------------------------
+# India Stock Universe — Top Nifty 50 Large-Cap Stocks (NSE)
+# ---------------------------------------------------------------------------
+INDIA_STOCK_UNIVERSE: list[str] = [
+    "RELIANCE",    # Reliance Industries
+    "TCS",         # Tata Consultancy Services
+    "HDFCBANK",    # HDFC Bank
+    "INFY",        # Infosys
+    "ICICIBANK",   # ICICI Bank
+    "HINDUNILVR",  # Hindustan Unilever
+    "ITC",         # ITC Ltd.
+    "SBIN",        # State Bank of India
+    "BHARTIARTL",  # Bharti Airtel
+    "LT",          # Larsen & Toubro
+    "KOTAKBANK",   # Kotak Mahindra Bank
+    "WIPRO",       # Wipro
+]
+
+# ===========================================================================
+# Strategy Parameters (Shared for both US & India)
+# ===========================================================================
 TIMEFRAME: str = "1Hour"
 LOOKBACK_BARS: int = 250
 
@@ -53,9 +90,16 @@ RSI_SELL_THRESHOLD: float = 65.0    # Take profit when overbought > 65
 
 BB_STD_DEV: float = 2.0
 
+# ===========================================================================
+# Risk Parameters (Shared for both US & India)
+# ===========================================================================
 MAX_POSITION_PCT: float = 0.05     # Max 5% of portfolio equity per stock
 STOP_LOSS_PCT: float = 0.02       # 2% hard stop-loss
 TAKE_PROFIT_PCT: float = 0.04     # 4% take-profit target
 DAILY_DRAWDOWN_LIMIT: float = 0.03 # 3% daily drawdown kill-switch
 
-LOOP_INTERVAL_SEC: int = 300       # 5-minute main loop cadence
+# ===========================================================================
+# Loop Intervals
+# ===========================================================================
+LOOP_INTERVAL_SEC: int = 300       # 5-minute main loop cadence (US)
+INDIA_LOOP_INTERVAL_SEC: int = 300 # 5-minute main loop cadence (India)
