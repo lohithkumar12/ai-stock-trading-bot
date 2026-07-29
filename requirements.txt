@@ -12,3 +12,4 @@ flask-cors>=4.0.0          # CORS for frontend API calls
 smartapi-python>=1.3.0     # Angel One SmartAPI SDK
 pyotp>=2.9.0               # TOTP generator for Angel One auto-login
 logzero>=1.7.0             # Logger dependency for SmartApi
+websocket-client>=1.6.0     # WebSocket dependency for SmartApi
