@@ -6,7 +6,7 @@ Wraps Angel One's SmartAPI for Indian stock trading (NSE).
 Handles:
   - Auto-login with TOTP generation (no manual OTP needed)
   - Session refresh on token expiry
-  - Historical candle data retrieval → pandas DataFrame
+  - Historical candle data retrieval → pandas DataFrame (cached)
   - Real-time LTP (Last Traded Price) quotes
   - Order placement (NORMAL variety with DELIVERY product)
   - Position tracking and closing
@@ -55,6 +55,7 @@ class IndiaBroker:
         self._logged_in = False
         self.last_error = ""
         self._last_candle_call_time = 0
+        self._candle_cache = {}  # {symbol: (timestamp, dataframe)}
 
         # Attempt login on initialization
         self.login()
@@ -153,7 +154,7 @@ class IndiaBroker:
             return None
 
     # -----------------------------------------------------------------------
-    # Historical Data (with Rate-Limiting Protection)
+    # Historical Data (with 30s Caching & Rate-Limiting Protection)
     # -----------------------------------------------------------------------
     def get_historical_bars(self, symbol: str, days: int = 300) -> pd.DataFrame | None:
         self.ensure_session()
@@ -164,11 +165,17 @@ class IndiaBroker:
             logger.error(f"No instrument token found for {symbol}")
             return None
 
-        # Rate-limiting: Angel One permits max 3 calls/sec (delay 350ms between calls)
+        # Return cached dataframe if less than 30 seconds old to prevent rate limits
         now_ts = time.time()
+        if symbol in self._candle_cache:
+            cache_time, cached_df = self._candle_cache[symbol]
+            if now_ts - cache_time < 30.0:
+                return cached_df
+
+        # Rate-limiting: Ensure 400ms gap between Angel One API calls
         time_since_last = now_ts - self._last_candle_call_time
-        if time_since_last < 0.35:
-            time.sleep(0.35 - time_since_last)
+        if time_since_last < 0.40:
+            time.sleep(0.40 - time_since_last)
         self._last_candle_call_time = time.time()
 
         try:
@@ -199,15 +206,21 @@ class IndiaBroker:
                 df.set_index("timestamp", inplace=True)
                 df = df.astype(float)
 
+                self._candle_cache[symbol] = (time.time(), df)
                 logger.debug(f"{symbol}: Fetched {len(df)} candles from Angel One")
                 return df
             else:
                 msg = result.get("message", "Unknown") if result else "No response"
                 logger.warning(f"{symbol}: Failed to fetch candles — {msg}")
+                # If cached version exists, return it as fallback
+                if symbol in self._candle_cache:
+                    return self._candle_cache[symbol][1]
                 return None
 
         except Exception as e:
             logger.error(f"{symbol}: Angel One historical data error: {e}", exc_info=True)
+            if symbol in self._candle_cache:
+                return self._candle_cache[symbol][1]
             return None
 
     # -----------------------------------------------------------------------
