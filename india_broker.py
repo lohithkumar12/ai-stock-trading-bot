@@ -29,6 +29,7 @@ from india_instruments import (
     get_trading_symbol,
     get_exchange,
 )
+from india_paper import IndiaPaperPortfolio
 
 logger = logging.getLogger(__name__)
 
@@ -37,8 +38,11 @@ class IndiaBroker:
     """
     Angel One SmartAPI broker client for Indian stock trading.
 
-    Manages authentication, market data, and order execution
-    for NSE-listed stocks via the SmartAPI.
+    When config.INDIA_PAPER is True:
+      - Market data (candles/LTP) comes from LIVE Angel One APIs
+      - Buys/sells update a virtual INR portfolio (no real orders)
+    When LIVE_CONFIRMED:
+      - Real CNC orders hit your Angel One account
     """
 
     def __init__(self):
@@ -57,7 +61,11 @@ class IndiaBroker:
         self._last_candle_call_time = 0
         self._candle_cache = {}  # {symbol: (timestamp, dataframe)}
 
-        # Attempt login on initialization
+        self.paper = IndiaPaperPortfolio() if config.INDIA_PAPER else None
+        mode = "PAPER SIM (live NSE data, fake INR)" if self.paper else "LIVE REAL MONEY"
+        logger.info(f"IndiaBroker mode: {mode}")
+
+        # Attempt login on initialization (needed for live market data either way)
         self.login()
 
     # -----------------------------------------------------------------------
@@ -122,6 +130,16 @@ class IndiaBroker:
     # Account Information
     # -----------------------------------------------------------------------
     def get_account_info(self) -> dict | None:
+        # Paper mode: virtual cash + live marks
+        if self.paper is not None:
+            marks = self._live_marks_for_positions(self.paper.positions.keys())
+            info = self.paper.get_account_info(marks)
+            logger.info(
+                f"Angel One PAPER | Equity=Rs {info['equity']:,.2f} | "
+                f"Cash=Rs {info['available_cash']:,.2f}"
+            )
+            return info
+
         self.ensure_session()
         try:
             rms_data = self.smart_api.rmsLimit()
@@ -136,9 +154,10 @@ class IndiaBroker:
                     "available_cash": available_cash,
                     "used_margin": used_margin,
                     "net": net,
+                    "paper": False,
                 }
                 logger.info(
-                    f"Angel One Account | Net={net:,.2f} | "
+                    f"Angel One LIVE | Net={net:,.2f} | "
                     f"Cash={available_cash:,.2f} | Used={used_margin:,.2f}"
                 )
                 return info
@@ -152,6 +171,14 @@ class IndiaBroker:
             self.last_error = f"RMS Error: {e}"
             logger.error(f"Angel One account info error: {e}", exc_info=True)
             return None
+
+    def _live_marks_for_positions(self, symbols) -> dict[str, float]:
+        marks = {}
+        for symbol in symbols:
+            quote = self.get_latest_quote(symbol)
+            if quote and quote.get("ltp"):
+                marks[symbol] = float(quote["ltp"])
+        return marks
 
     # -----------------------------------------------------------------------
     # Historical Data (with 30s Caching & Rate-Limiting Protection)
@@ -259,54 +286,125 @@ class IndiaBroker:
             return None
 
     # -----------------------------------------------------------------------
-    # Position Tracking
+    # Live Trading Gate
+    # -----------------------------------------------------------------------
+    def _assert_live_allowed(self, action: str) -> bool:
+        """Allow paper sim always; block real orders unless LIVE_CONFIRMED."""
+        if self.paper is not None:
+            return True
+        if not config.LIVE_CONFIRMED:
+            logger.critical(
+                f"BLOCKED {action}: Live trading is OFF. "
+                f"Keep INDIA_PAPER=true for testing, or set "
+                f"LIVE_TRADING=true and LIVE_CONFIRM=YES_REAL_MONEY for real money."
+            )
+            self.last_error = "Live trading not confirmed"
+            return False
+        return True
+
+    @staticmethod
+    def _extract_order_id(result) -> str | None:
+        """Normalize Angel One placeOrder response to an order id string."""
+        if result is None:
+            return None
+        if isinstance(result, str) and result.strip():
+            return result.strip()
+        if isinstance(result, dict):
+            if result.get("status") is False:
+                return None
+            data = result.get("data")
+            if isinstance(data, dict):
+                oid = data.get("orderid") or data.get("orderId")
+                if oid:
+                    return str(oid)
+            if result.get("orderid"):
+                return str(result["orderid"])
+        return str(result) if result else None
+
+    # -----------------------------------------------------------------------
+    # Position Tracking (paper OR live positions + CNC holdings)
     # -----------------------------------------------------------------------
     def get_open_positions(self) -> dict:
-        self.ensure_session()
-        try:
-            position_data = self.smart_api.position()
-
-            if not position_data or not position_data.get("status"):
-                logger.debug("No position data from Angel One")
-                return {}
-
-            positions = position_data.get("data", [])
-            if not positions:
-                return {}
-
-            pos_dict = {}
-            for pos in positions:
-                net_qty = int(pos.get("netqty", 0))
-                if net_qty == 0:
-                    continue
-
-                symbol_raw = pos.get("tradingsymbol", "")
-                symbol = symbol_raw.replace("-EQ", "")
-
-                buy_price = float(pos.get("averageprice", 0))
-                ltp = float(pos.get("ltp", 0))
-                pnl = float(pos.get("pnl", 0))
-                pnl_pct = ((ltp - buy_price) / buy_price) if buy_price > 0 else 0
-
-                pos_dict[symbol] = {
-                    "qty": abs(net_qty),
-                    "avg_entry_price": buy_price,
-                    "current_price": ltp,
-                    "market_value": abs(net_qty) * ltp,
-                    "unrealized_pl": pnl,
-                    "unrealized_plpc": pnl_pct,
-                    "trading_symbol": symbol_raw,
-                    "token": pos.get("symboltoken", ""),
-                }
-
+        if self.paper is not None:
+            marks = self._live_marks_for_positions(self.paper.positions.keys())
+            pos_dict = self.paper.get_open_positions(marks)
             if pos_dict:
-                logger.info(f"India positions: {list(pos_dict.keys())}")
-
+                logger.info(f"India PAPER positions: {list(pos_dict.keys())}")
             return pos_dict
 
+        self.ensure_session()
+        pos_dict: dict = {}
+
+        try:
+            position_data = self.smart_api.position()
+            if position_data and position_data.get("status"):
+                for pos in position_data.get("data") or []:
+                    net_qty = int(float(pos.get("netqty", 0) or 0))
+                    if net_qty == 0:
+                        continue
+
+                    symbol_raw = pos.get("tradingsymbol", "")
+                    symbol = symbol_raw.replace("-EQ", "")
+                    buy_price = float(pos.get("averageprice", 0) or 0)
+                    ltp = float(pos.get("ltp", 0) or 0)
+                    pnl = float(pos.get("pnl", 0) or 0)
+                    pnl_pct = ((ltp - buy_price) / buy_price) if buy_price > 0 else 0
+
+                    pos_dict[symbol] = {
+                        "qty": abs(net_qty),
+                        "avg_entry_price": buy_price,
+                        "current_price": ltp,
+                        "market_value": abs(net_qty) * ltp,
+                        "unrealized_pl": pnl,
+                        "unrealized_plpc": pnl_pct,
+                        "trading_symbol": symbol_raw,
+                        "token": pos.get("symboltoken", ""),
+                        "source": "position",
+                    }
         except Exception as e:
             logger.error(f"Angel One positions error: {e}", exc_info=True)
-            return {}
+
+        try:
+            holding_data = self.smart_api.holding()
+            if holding_data and holding_data.get("status"):
+                for h in holding_data.get("data") or []:
+                    qty = int(float(h.get("quantity", 0) or 0))
+                    if qty <= 0:
+                        continue
+
+                    symbol_raw = h.get("tradingsymbol", "")
+                    symbol = symbol_raw.replace("-EQ", "")
+                    if symbol in pos_dict:
+                        continue
+
+                    buy_price = float(
+                        h.get("averageprice")
+                        or h.get("avgprice")
+                        or 0
+                    )
+                    ltp = float(h.get("ltp", 0) or 0)
+                    pnl = float(h.get("profitandloss") or h.get("pnl") or 0)
+                    if buy_price <= 0 and ltp > 0:
+                        buy_price = ltp
+                    pnl_pct = ((ltp - buy_price) / buy_price) if buy_price > 0 else 0
+
+                    pos_dict[symbol] = {
+                        "qty": qty,
+                        "avg_entry_price": buy_price,
+                        "current_price": ltp,
+                        "market_value": qty * ltp,
+                        "unrealized_pl": pnl,
+                        "unrealized_plpc": pnl_pct,
+                        "trading_symbol": symbol_raw,
+                        "token": h.get("symboltoken", ""),
+                        "source": "holding",
+                    }
+        except Exception as e:
+            logger.warning(f"Angel One holdings fetch warning: {e}")
+
+        if pos_dict:
+            logger.info(f"India positions/holdings: {list(pos_dict.keys())}")
+        return pos_dict
 
     # -----------------------------------------------------------------------
     # Order Placement
@@ -316,7 +414,23 @@ class IndiaBroker:
         symbol: str,
         qty: int,
         limit_price: float,
+        place_stoploss: bool = True,
+        stop_loss_pct: float | None = None,
     ) -> str | None:
+        if not self._assert_live_allowed(f"BUY {symbol}"):
+            return None
+
+        if qty <= 0 or limit_price <= 0:
+            logger.error(f"Invalid buy params for {symbol}: qty={qty} price={limit_price}")
+            return None
+
+        # ----- PAPER SIM (live LTP, fake fill) -----
+        if self.paper is not None:
+            quote = self.get_latest_quote(symbol)
+            fill = float(quote["ltp"]) if quote else float(limit_price)
+            return self.paper.buy(symbol, qty, fill)
+
+        # ----- LIVE REAL ORDERS -----
         self.ensure_session()
         token = get_token(symbol)
         trading_symbol = get_trading_symbol(symbol)
@@ -327,6 +441,8 @@ class IndiaBroker:
             return None
 
         try:
+            entry_price = round(limit_price * 1.001, 2)
+
             order_params = {
                 "variety": "NORMAL",
                 "tradingsymbol": trading_symbol,
@@ -336,21 +452,89 @@ class IndiaBroker:
                 "ordertype": "LIMIT",
                 "producttype": "CNC",
                 "duration": "DAY",
-                "price": str(round(limit_price, 2)),
+                "price": str(entry_price),
                 "quantity": str(qty),
             }
 
-            order_id = self.smart_api.placeOrder(order_params)
+            raw = self.smart_api.placeOrder(order_params)
+            order_id = self._extract_order_id(raw)
 
-            logger.info(
-                f"BUY ORDER PLACED | {symbol} | "
-                f"Qty={qty} | Price={limit_price:.2f} | "
-                f"Order ID={order_id}"
+            if not order_id:
+                logger.error(f"BUY rejected for {symbol}: {raw}")
+                self.last_error = f"Buy rejected: {raw}"
+                return None
+
+            logger.warning(
+                f"LIVE BUY ORDER | {symbol} | Qty={qty} | "
+                f"Limit={entry_price:.2f} | Order ID={order_id}"
             )
+
+            if place_stoploss:
+                sl_pct = stop_loss_pct if stop_loss_pct is not None else config.STOP_LOSS_PCT
+                sl_trigger = round(entry_price * (1 - sl_pct), 2)
+                self.place_stoploss_order(symbol, qty, sl_trigger)
+
             return order_id
 
         except Exception as e:
             logger.error(f"Failed to place BUY order for {symbol}: {e}", exc_info=True)
+            return None
+
+    def place_stoploss_order(
+        self,
+        symbol: str,
+        qty: int,
+        trigger_price: float,
+    ) -> str | None:
+        """Broker-side day SL — skipped in paper mode (software SL handles it)."""
+        if self.paper is not None:
+            logger.info(
+                f"[PAPER] Soft stop-loss armed for {symbol} @ {trigger_price:.2f}"
+            )
+            return f"PAPER-SL-{symbol}"
+
+        if not self._assert_live_allowed(f"SL {symbol}"):
+            return None
+
+        self.ensure_session()
+        token = get_token(symbol)
+        trading_symbol = get_trading_symbol(symbol)
+        exchange = get_exchange(symbol)
+
+        if not token or not trading_symbol or qty <= 0 or trigger_price <= 0:
+            return None
+
+        try:
+            limit_price = round(trigger_price * 0.995, 2)
+
+            order_params = {
+                "variety": "STOPLOSS",
+                "tradingsymbol": trading_symbol,
+                "symboltoken": token,
+                "transactiontype": "SELL",
+                "exchange": exchange,
+                "ordertype": "STOPLOSS_LIMIT",
+                "producttype": "CNC",
+                "duration": "DAY",
+                "price": str(limit_price),
+                "triggerprice": str(round(trigger_price, 2)),
+                "quantity": str(qty),
+            }
+
+            raw = self.smart_api.placeOrder(order_params)
+            order_id = self._extract_order_id(raw)
+
+            if order_id:
+                logger.warning(
+                    f"LIVE STOP-LOSS | {symbol} | Qty={qty} | "
+                    f"Trigger={trigger_price:.2f} | Order ID={order_id}"
+                )
+            else:
+                logger.error(f"Stop-loss not accepted for {symbol}: {raw}")
+            return order_id
+
+        except Exception as e:
+            logger.error(f"Failed to place stop-loss for {symbol}: {e}", exc_info=True)
             return None
 
     def place_sell_order(
@@ -360,6 +544,19 @@ class IndiaBroker:
         limit_price: float = 0,
         order_type: str = "MARKET",
     ) -> str | None:
+        if not self._assert_live_allowed(f"SELL {symbol}"):
+            return None
+
+        # ----- PAPER SIM -----
+        if self.paper is not None:
+            quote = self.get_latest_quote(symbol)
+            fill = float(quote["ltp"]) if quote else float(limit_price or 0)
+            if fill <= 0:
+                logger.error(f"[PAPER] No LTP to sell {symbol}")
+                return None
+            return self.paper.sell(symbol, qty, fill)
+
+        # ----- LIVE -----
         self.ensure_session()
         token = get_token(symbol)
         trading_symbol = get_trading_symbol(symbol)
@@ -370,27 +567,40 @@ class IndiaBroker:
             return None
 
         try:
+            if order_type == "MARKET" and limit_price <= 0:
+                quote = self.get_latest_quote(symbol)
+                if quote:
+                    limit_price = round(quote["ltp"] * 0.995, 2)
+                    order_type = "LIMIT"
+
             order_params = {
                 "variety": "NORMAL",
                 "tradingsymbol": trading_symbol,
                 "symboltoken": token,
                 "transactiontype": "SELL",
                 "exchange": exchange,
-                "ordertype": order_type,
+                "ordertype": order_type if order_type != "MARKET" else "LIMIT",
                 "producttype": "CNC",
                 "duration": "DAY",
                 "quantity": str(qty),
             }
 
-            if order_type == "LIMIT" and limit_price > 0:
+            if order_params["ordertype"] == "LIMIT":
+                if limit_price <= 0:
+                    logger.error(f"Sell needs a limit price for {symbol}")
+                    return None
                 order_params["price"] = str(round(limit_price, 2))
 
-            order_id = self.smart_api.placeOrder(order_params)
+            raw = self.smart_api.placeOrder(order_params)
+            order_id = self._extract_order_id(raw)
 
-            logger.info(
-                f"SELL ORDER PLACED | {symbol} | "
-                f"Qty={qty} | Type={order_type} | "
-                f"Order ID={order_id}"
+            if not order_id:
+                logger.error(f"SELL rejected for {symbol}: {raw}")
+                return None
+
+            logger.warning(
+                f"LIVE SELL ORDER | {symbol} | Qty={qty} | "
+                f"Type={order_params['ordertype']} | Order ID={order_id}"
             )
             return order_id
 
@@ -442,6 +652,10 @@ class IndiaBroker:
         return closed_symbols
 
     def cancel_all_open_orders(self) -> bool:
+        if self.paper is not None:
+            logger.info("[PAPER] No broker orders to cancel")
+            return True
+
         self.ensure_session()
         try:
             order_book = self.smart_api.orderBook()

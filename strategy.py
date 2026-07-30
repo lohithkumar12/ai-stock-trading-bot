@@ -61,9 +61,10 @@ class Strategy:
         return df
 
     def generate_signal(self, df: pd.DataFrame, symbol: str) -> str:
-        if config.TEST_MODE and symbol in ["AAPL", "SPY"]:
-            logger.info(f"[TEST MODE] Forcing BUY signal for {symbol} to demonstrate order execution!")
-            return "BUY"
+        # TEST_MODE fake buys are disabled permanently for live capital safety
+        if config.TEST_MODE:
+            logger.error(f"{symbol}: TEST_MODE is on — refusing signal generation.")
+            return "HOLD"
 
         if len(df) < self.sma_slow + 1:
             logger.warning(f"{symbol}: Not enough data ({len(df)} bars) for {self.sma_slow}-period SMA. Signal -> HOLD.")
@@ -81,17 +82,23 @@ class Strategy:
             return "HOLD"
 
         logger.info(
-            f"{symbol} Indicators | Close=${close:.2f} | "
-            f"SMA{self.sma_slow}=${sma_slow:.2f} | RSI={rsi:.1f} | "
-            f"BBL=${bbl:.2f} | BBU=${bbu:.2f}"
+            f"{symbol} Indicators | Close={close:.2f} | "
+            f"SMA{self.sma_slow}={sma_slow:.2f} | RSI={rsi:.1f} | "
+            f"BBL={bbl:.2f} | BBU={bbu:.2f}"
         )
 
         if close > sma_slow and rsi < self.rsi_buy and close <= bbl:
             logger.info(f"[BUY SIGNAL] {symbol} -- Uptrend + Oversold + Lower BB touch")
             return "BUY"
 
-        if rsi > self.rsi_sell or close >= bbu:
-            logger.info(f"[SELL SIGNAL] {symbol} -- Overbought or Upper BB touch")
-            return "SELL"
+        # Strict sell: need BOTH overbought RSI and upper BB (fewer noise exits)
+        if config.STRICT_SELL:
+            if rsi > self.rsi_sell and close >= bbu:
+                logger.info(f"[SELL SIGNAL] {symbol} -- Overbought AND Upper BB touch")
+                return "SELL"
+        else:
+            if rsi > self.rsi_sell or close >= bbu:
+                logger.info(f"[SELL SIGNAL] {symbol} -- Overbought or Upper BB touch")
+                return "SELL"
 
         return "HOLD"

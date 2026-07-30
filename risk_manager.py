@@ -70,11 +70,20 @@ class RiskManager:
         max_dollar_amount = equity * self.max_position_pct
         shares = int(max_dollar_amount // price)
 
+        # Live-capital hard cap
+        max_shares = getattr(config, "MAX_SHARES_PER_ORDER", 50)
+        if shares > max_shares:
+            logger.warning(
+                f"Position size capped: {shares} → {max_shares} shares "
+                f"(MAX_SHARES_PER_ORDER)"
+            )
+            shares = max_shares
+
         logger.info(
             f"Position sizing: "
-            f"Equity=${equity:,.2f} × {self.max_position_pct:.0%} "
-            f"= ${max_dollar_amount:,.2f} budget → "
-            f"{shares} shares @ ${price:.2f}/share"
+            f"Equity={equity:,.2f} × {self.max_position_pct:.0%} "
+            f"= {max_dollar_amount:,.2f} budget → "
+            f"{shares} shares @ {price:.2f}/share"
         )
         return shares
 

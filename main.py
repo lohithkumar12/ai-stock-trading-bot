@@ -1,13 +1,13 @@
 """
 main.py — Main Orchestrator & Web Admin Dashboard Launcher
 ===========================================================
-Entry point for the Unified AI Stock Trading Bot.
+24/7 dual-market bot:
+  US    → Alpaca PAPER (fake USD) + live US prices
+  India → Angel One PAPER SIM (fake INR) + live NSE prices
+          (or real INR when LIVE_TRADING is armed)
 
-Runs two parallel trading loops:
-  1. US Market Loop  — Alpaca API (9:30 AM - 4:00 PM ET / 7:00 PM - 1:30 AM IST)
-  2. India Market Loop — Angel One SmartAPI (9:15 AM - 3:30 PM IST)
-
-Both loops share the same Strategy engine and RiskManager.
+Dashboard tabs: US | India | Combined
+Process stays alive around the clock; trades only during market hours.
 """
 
 import logging
@@ -17,10 +17,8 @@ import threading
 from datetime import datetime
 
 import config
-from data_feed import DataFeed
 from strategy import Strategy
 from risk_manager import RiskManager
-from execution import TradeExecutor
 from dashboard_server import start_dashboard_in_background
 
 try:
@@ -54,11 +52,7 @@ def setup_logging():
 logger = logging.getLogger("main")
 
 
-# ===========================================================================
-# Market Hours Detection
-# ===========================================================================
 def is_us_market_open() -> bool:
-    """Check if US stock market is currently open (9:30 AM - 4:00 PM ET)."""
     now_et = datetime.now(EASTERN)
     if now_et.weekday() >= 5:
         return False
@@ -68,7 +62,6 @@ def is_us_market_open() -> bool:
 
 
 def is_india_market_open() -> bool:
-    """Check if India stock market is currently open (9:15 AM - 3:30 PM IST)."""
     now_ist = datetime.now(IST)
     if now_ist.weekday() >= 5:
         return False
@@ -77,10 +70,7 @@ def is_india_market_open() -> bool:
     return market_open <= now_ist <= market_close
 
 
-# ===========================================================================
-# Portfolio Summary Logging
-# ===========================================================================
-def log_portfolio_summary(executor: TradeExecutor, market_label: str = "US"):
+def log_portfolio_summary(executor, market_label: str = "US"):
     positions = executor.get_open_positions()
     if not positions:
         logger.info(f"[{market_label} PORTFOLIO] No open positions.")
@@ -107,7 +97,6 @@ def log_portfolio_summary(executor: TradeExecutor, market_label: str = "US"):
 
 
 def log_india_portfolio_summary(india_broker, market_label: str = "INDIA"):
-    """Log India portfolio summary (uses INR)."""
     positions = india_broker.get_open_positions()
     if not positions:
         logger.info(f"[{market_label} PORTFOLIO] No open positions.")
@@ -133,12 +122,8 @@ def log_india_portfolio_summary(india_broker, market_label: str = "INDIA"):
     logger.info(f"   Total Unrealized P&L: Rs {total_pl:,.2f}")
 
 
-# ===========================================================================
-# US Market Trading Loop
-# ===========================================================================
 def run_us_loop(data_feed, strategy, risk_mgr, executor):
-    """Main US market trading loop — runs continuously."""
-    logger.info("[US] US Market trading loop started")
+    logger.info("[US] US Market trading loop started (24/7 process)")
 
     while True:
         try:
@@ -147,8 +132,8 @@ def run_us_loop(data_feed, strategy, risk_mgr, executor):
             if not is_us_market_open():
                 now_et = datetime.now(EASTERN)
                 logger.info(
-                    f"[US STATUS] Market is CLOSED ({now_et.strftime('%A %I:%M %p ET')}). "
-                    f"Next check in {config.LOOP_INTERVAL_SEC}s..."
+                    f"[US STATUS] Market CLOSED ({now_et.strftime('%A %I:%M %p ET')}). "
+                    f"Bot still alive — next check in {config.LOOP_INTERVAL_SEC}s..."
                 )
                 time.sleep(config.LOOP_INTERVAL_SEC)
                 if now_et.hour == 0 and now_et.minute < 6:
@@ -157,7 +142,8 @@ def run_us_loop(data_feed, strategy, risk_mgr, executor):
 
             logger.info("-" * 60)
             logger.info(
-                f"[US CYCLE] NEW TRADING CYCLE -- {datetime.now(EASTERN).strftime('%Y-%m-%d %I:%M:%S %p ET')}"
+                f"[US CYCLE] {datetime.now(EASTERN).strftime('%Y-%m-%d %I:%M:%S %p ET')} "
+                f"| Mode={'PAPER' if config.PAPER_TRADING else 'LIVE'}"
             )
 
             account = executor.get_account_info()
@@ -170,9 +156,7 @@ def run_us_loop(data_feed, strategy, risk_mgr, executor):
             sod_equity = account["last_equity"]
 
             if risk_mgr.check_daily_drawdown(current_equity, sod_equity):
-                logger.critical(
-                    "[US KILL-SWITCH] Trading PAUSED due to daily drawdown limit breach."
-                )
+                logger.critical("[US KILL-SWITCH] Trading PAUSED (daily drawdown).")
                 executor.cancel_all_open_orders()
                 time.sleep(config.LOOP_INTERVAL_SEC)
                 continue
@@ -184,7 +168,7 @@ def run_us_loop(data_feed, strategy, risk_mgr, executor):
 
                 df = data_feed.get_historical_bars(symbol)
                 if df is None or df.empty:
-                    logger.warning(f"[US] {symbol}: No data available -- skipping.")
+                    logger.warning(f"[US] {symbol}: No data — skipping.")
                     continue
 
                 df = strategy.compute_indicators(df)
@@ -196,54 +180,42 @@ def run_us_loop(data_feed, strategy, risk_mgr, executor):
 
                     quote = data_feed.get_latest_quote(symbol)
                     if quote is None:
-                        logger.warning(f"[US] {symbol}: Cannot retrieve quote -- skipping buy.")
                         continue
 
                     limit_price = quote["ask_price"]
                     qty = risk_mgr.calculate_position_size(current_equity, limit_price)
                     if qty <= 0:
-                        logger.info(f"[US] {symbol}: Calculated position size is 0 -- skipping.")
                         continue
-
-                    sl_price = risk_mgr.get_stop_loss_price(limit_price)
-                    tp_price = risk_mgr.get_take_profit_price(limit_price)
 
                     executor.submit_bracket_order(
                         symbol=symbol,
                         qty=qty,
                         limit_price=limit_price,
-                        stop_loss_price=sl_price,
-                        take_profit_price=tp_price,
+                        stop_loss_price=risk_mgr.get_stop_loss_price(limit_price),
+                        take_profit_price=risk_mgr.get_take_profit_price(limit_price),
                     )
 
-                elif signal == "SELL":
-                    if symbol in current_positions:
-                        executor.close_position(symbol)
-                    else:
-                        logger.debug(f"[US] {symbol}: SELL signal but no position held -- skipping.")
+                elif signal == "SELL" and symbol in current_positions:
+                    executor.close_position(symbol)
 
             log_portfolio_summary(executor, "US")
 
             elapsed = time.time() - loop_start
             sleep_time = max(0, config.LOOP_INTERVAL_SEC - elapsed)
-            logger.info(f"[US COMPLETE] Cycle complete ({elapsed:.1f}s). Next in {sleep_time:.0f}s.\n")
+            logger.info(f"[US COMPLETE] Cycle done ({elapsed:.1f}s). Next in {sleep_time:.0f}s.\n")
             time.sleep(sleep_time)
 
         except KeyboardInterrupt:
             raise
         except Exception as e:
-            logger.error(f"[US ERROR] Unexpected error in US loop: {e}", exc_info=True)
+            logger.error(f"[US ERROR] {e}", exc_info=True)
             time.sleep(config.LOOP_INTERVAL_SEC)
 
 
-# ===========================================================================
-# India Market Trading Loop
-# ===========================================================================
 def run_india_loop(strategy, risk_mgr):
-    """Main India market trading loop — runs continuously."""
     from india_broker import IndiaBroker
 
-    logger.info("[INDIA] India Market trading loop starting...")
+    logger.info("[INDIA] India Market trading loop starting (24/7 process)...")
 
     try:
         india_broker = IndiaBroker()
@@ -251,46 +223,80 @@ def run_india_loop(strategy, risk_mgr):
         logger.error(f"[INDIA] Failed to initialize India broker: {e}")
         return
 
+    if not india_broker.is_logged_in:
+        logger.error(
+            f"[INDIA] Login failed: {india_broker.last_error}. "
+            "Need Angel One login for LIVE NSE data even in paper mode."
+        )
+        return
+
     india_broker.cancel_all_open_orders()
-    logger.info("[INDIA] India modules initialized. Entering India trading loop...")
+
+    start_of_day_equity = None
+    last_reset_date = None
+    paper = india_broker.paper is not None
+
+    logger.info(
+        f"[INDIA] Ready | Mode={'PAPER SIM + live NSE data' if paper else 'LIVE REAL MONEY'}"
+    )
 
     while True:
         try:
             loop_start = time.time()
+            now_ist = datetime.now(IST)
+
+            if last_reset_date != now_ist.date():
+                risk_mgr.reset_kill_switch()
+                start_of_day_equity = None
+                last_reset_date = now_ist.date()
+                if india_broker.paper is not None:
+                    india_broker.paper.start_of_day_equity = None
+                logger.info(f"[INDIA] New day {now_ist.date()} — kill-switch reset")
 
             if not is_india_market_open():
-                now_ist = datetime.now(IST)
                 logger.info(
-                    f"[INDIA STATUS] Market is CLOSED ({now_ist.strftime('%A %I:%M %p IST')}). "
-                    f"Next check in {config.INDIA_LOOP_INTERVAL_SEC}s..."
+                    f"[INDIA STATUS] Market CLOSED ({now_ist.strftime('%A %I:%M %p IST')}). "
+                    f"Bot still alive — next check in {config.INDIA_LOOP_INTERVAL_SEC}s..."
                 )
-
-                # Re-login at 9:10 AM IST for fresh session
                 if now_ist.hour == 9 and 10 <= now_ist.minute < 15:
-                    logger.info("[INDIA] Pre-market session refresh...")
                     india_broker.login()
-
                 time.sleep(config.INDIA_LOOP_INTERVAL_SEC)
                 continue
 
             logger.info("=" * 60)
             logger.info(
-                f"[INDIA CYCLE] NEW TRADING CYCLE -- {datetime.now(IST).strftime('%Y-%m-%d %I:%M:%S %p IST')}"
+                f"[INDIA CYCLE] {now_ist.strftime('%Y-%m-%d %I:%M:%S %p IST')} | "
+                f"Mode={'PAPER' if paper else 'LIVE'}"
             )
 
-            # Check SL/TP for existing positions first
             closed = india_broker.check_sl_tp(risk_mgr)
             if closed:
-                logger.info(f"[INDIA] Closed positions due to SL/TP: {closed}")
+                logger.info(f"[INDIA] Closed via SL/TP: {closed}")
 
-            # Get account info for position sizing
             account = india_broker.get_account_info()
             if account is None:
-                logger.error("[INDIA] Cannot retrieve account info -- skipping cycle.")
+                logger.error("[INDIA] Cannot retrieve account info — skipping.")
                 time.sleep(config.INDIA_LOOP_INTERVAL_SEC)
                 continue
 
             current_equity = account["equity"]
+            sod = account.get("last_equity") or start_of_day_equity
+            if sod is None or sod <= 0:
+                sod = current_equity
+                start_of_day_equity = current_equity
+            else:
+                start_of_day_equity = sod
+
+            if risk_mgr.check_daily_drawdown(current_equity, start_of_day_equity):
+                logger.critical("[INDIA KILL-SWITCH] Trading PAUSED (daily drawdown).")
+                india_broker.cancel_all_open_orders()
+                time.sleep(config.INDIA_LOOP_INTERVAL_SEC)
+                continue
+
+            if risk_mgr.is_kill_switch_active:
+                time.sleep(config.INDIA_LOOP_INTERVAL_SEC)
+                continue
+
             current_positions = india_broker.get_open_positions()
 
             for symbol in config.INDIA_STOCK_UNIVERSE:
@@ -298,7 +304,7 @@ def run_india_loop(strategy, risk_mgr):
 
                 df = india_broker.get_historical_bars(symbol)
                 if df is None or df.empty:
-                    logger.warning(f"[INDIA] {symbol}: No data available -- skipping.")
+                    logger.warning(f"[INDIA] {symbol}: No data — skipping.")
                     continue
 
                 df = strategy.compute_indicators(df)
@@ -310,117 +316,121 @@ def run_india_loop(strategy, risk_mgr):
 
                     quote = india_broker.get_latest_quote(symbol)
                     if quote is None:
-                        logger.warning(f"[INDIA] {symbol}: Cannot retrieve quote -- skipping buy.")
                         continue
 
+                    sizing_equity = min(
+                        current_equity,
+                        float(account.get("available_cash") or current_equity),
+                    )
                     limit_price = quote["ltp"]
-                    qty = risk_mgr.calculate_position_size(current_equity, limit_price)
+                    qty = risk_mgr.calculate_position_size(sizing_equity, limit_price)
                     if qty <= 0:
-                        logger.info(f"[INDIA] {symbol}: Calculated position size is 0 -- skipping.")
                         continue
 
-                    india_broker.place_buy_order(
+                    order_id = india_broker.place_buy_order(
                         symbol=symbol,
                         qty=qty,
                         limit_price=limit_price,
                     )
+                    if order_id:
+                        current_positions[symbol] = {"qty": qty}
 
-                elif signal == "SELL":
-                    if symbol in current_positions:
-                        india_broker.close_position(symbol)
-                    else:
-                        logger.debug(f"[INDIA] {symbol}: SELL signal but no position -- skipping.")
+                elif signal == "SELL" and symbol in current_positions:
+                    india_broker.close_position(symbol)
 
             log_india_portfolio_summary(india_broker, "INDIA")
 
             elapsed = time.time() - loop_start
             sleep_time = max(0, config.INDIA_LOOP_INTERVAL_SEC - elapsed)
-            logger.info(f"[INDIA COMPLETE] Cycle complete ({elapsed:.1f}s). Next in {sleep_time:.0f}s.\n")
+            logger.info(f"[INDIA COMPLETE] Cycle done ({elapsed:.1f}s). Next in {sleep_time:.0f}s.\n")
             time.sleep(sleep_time)
 
         except KeyboardInterrupt:
             raise
         except Exception as e:
-            logger.error(f"[INDIA ERROR] Unexpected error in India loop: {e}", exc_info=True)
+            logger.error(f"[INDIA ERROR] {e}", exc_info=True)
             time.sleep(config.INDIA_LOOP_INTERVAL_SEC)
 
 
-# ===========================================================================
-# Main Entry Point
-# ===========================================================================
 def run_bot():
     logger.info("=" * 70)
-    logger.info("   UNIFIED AI STOCK TRADING BOT -- STARTING UP")
-    logger.info(f"   US Mode: {'PAPER TRADING (Safe)' if config.PAPER_TRADING else 'LIVE TRADING'}")
-    logger.info(f"   US Universe: {config.STOCK_UNIVERSE}")
-    logger.info(f"   India Enabled: {config.INDIA_ENABLED}")
-    if config.INDIA_ENABLED:
-        logger.info(f"   India Universe: {config.INDIA_STOCK_UNIVERSE}")
-    logger.info(f"   Loop Intervals: US={config.LOOP_INTERVAL_SEC}s | India={config.INDIA_LOOP_INTERVAL_SEC}s")
+    logger.info("   AI QUANT BOT — 24/7 DUAL MARKET")
+    logger.info(
+        f"   US: enabled={config.US_ENABLED} | "
+        f"paper={config.PAPER_TRADING} | keys_ok={not config.IS_PLACEHOLDER_KEY}"
+    )
+    logger.info(
+        f"   India: enabled={config.INDIA_ENABLED} | "
+        f"paper_sim={config.INDIA_PAPER} | live_armed={config.LIVE_CONFIRMED}"
+    )
     logger.info("=" * 70)
 
-    # Start Web Dashboard
+    if not config.INDIA_ENABLED and (not config.US_ENABLED or config.IS_PLACEHOLDER_KEY):
+        logger.critical("No markets configured. Add Alpaca and/or Angel One keys to .env")
+        return
+
+    if config.LIVE_CONFIRMED:
+        logger.critical("!!! INDIA REAL MONEY MODE ARMED !!!")
+    elif config.INDIA_PAPER:
+        logger.info("India PAPER SIM on — live NSE data, fake INR (safe for testing)")
+
     try:
         start_dashboard_in_background(port=5000)
-        logger.info("[DASHBOARD] Unified Web Dashboard running at http://localhost:5000")
+        logger.info("[DASHBOARD] http://localhost:5000  (US / India / Combined tabs)")
     except Exception as e:
-        logger.warning(f"Could not start Web Dashboard: {e}")
+        logger.warning(f"Dashboard failed to start: {e}")
 
-    # Wait for valid Alpaca API keys
-    if config.IS_PLACEHOLDER_KEY:
-        logger.error("=" * 70)
-        logger.error("[ERROR] ALPACA API KEYS NOT CONFIGURED IN .env FILE!")
-        logger.error("   Dashboard is running — waiting for keys...")
-        logger.error("=" * 70)
+    us_strategy = Strategy()
+    india_strategy = Strategy()
+    us_risk = RiskManager()
+    india_risk = RiskManager()
 
-        while config.IS_PLACEHOLDER_KEY:
-            time.sleep(10)
-            from dotenv import load_dotenv
-            load_dotenv(override=True)
-            import os
-            config.ALPACA_API_KEY = os.getenv("ALPACA_API_KEY", "").strip()
-            config.ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "").strip()
-            config.IS_PLACEHOLDER_KEY = (
-                not config.ALPACA_API_KEY
-                or "your_api_key_here" in config.ALPACA_API_KEY
-            )
-            if not config.IS_PLACEHOLDER_KEY:
-                logger.info("[SUCCESS] Valid Alpaca API Keys loaded!")
+    # US loop in background
+    if config.US_ENABLED and not config.IS_PLACEHOLDER_KEY:
+        from data_feed import DataFeed
+        from execution import TradeExecutor
 
-    # Initialize shared components
-    data_feed = DataFeed()
-    strategy = Strategy()
-    risk_mgr = RiskManager()
-    executor = TradeExecutor()
+        data_feed = DataFeed()
+        executor = TradeExecutor()
+        executor.cancel_all_open_orders()
+        us_thread = threading.Thread(
+            target=run_us_loop,
+            args=(data_feed, us_strategy, us_risk, executor),
+            daemon=True,
+            name="USMarketLoop",
+        )
+        us_thread.start()
+        logger.info("[US] Background loop started (Alpaca paper + live data)")
+    else:
+        logger.warning("[US] Disabled or missing Alpaca keys")
 
-    executor.cancel_all_open_orders()
-    logger.info("US modules initialized. Starting trading loops...\n")
-
-    # Start India loop in a separate thread if enabled
+    # India loop in background
     if config.INDIA_ENABLED:
         india_thread = threading.Thread(
             target=run_india_loop,
-            args=(strategy, risk_mgr),
+            args=(india_strategy, india_risk),
             daemon=True,
             name="IndiaMarketLoop",
         )
         india_thread.start()
-        logger.info("[INDIA] India Market trading loop started in background thread")
+        logger.info("[INDIA] Background loop started (Angel One + paper/live)")
     else:
-        logger.info("[INDIA] India trading DISABLED — no Angel One credentials in .env")
+        logger.warning("[INDIA] Disabled — missing Angel One credentials")
 
-    # Run US loop in main thread
-    run_us_loop(data_feed, strategy, risk_mgr, executor)
+    # Keep process alive 24/7 for Render / local
+    logger.info("[MAIN] Process staying alive 24/7 for dashboard + market loops")
+    while True:
+        time.sleep(60)
 
 
 if __name__ == "__main__":
     setup_logging()
-    logger.info("Starting Unified AI Stock Trading Bot (US + India)...")
+    logger.info("Starting AI Quant Bot (24/7 dual market)...")
     try:
         run_bot()
     except KeyboardInterrupt:
-        logger.info("\nBot stopped by user (Ctrl+C). Shutting down gracefully.")
+        logger.info("\nBot stopped by user (Ctrl+C).")
         sys.exit(0)
     except Exception as e:
-        logger.critical(f"Fatal error -- bot crashed: {e}", exc_info=True)
+        logger.critical(f"Fatal error: {e}", exc_info=True)
         sys.exit(1)

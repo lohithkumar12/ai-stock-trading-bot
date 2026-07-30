@@ -199,6 +199,11 @@ function updateStatusUI(data, currencySymbol, formatter) {
     document.getElementById("buying-power-val").textContent = formatter(data.buying_power);
     document.getElementById("cash-val").textContent = `Cash: ${formatter(data.cash)}`;
 
+    const modeText = document.getElementById("mode-text");
+    if (modeText) {
+        modeText.textContent = data.paper_trading ? "US Paper (live prices)" : "US LIVE MONEY";
+    }
+
     const marketStatusEl = document.getElementById("market-status");
     const marketBadge = document.getElementById("market-badge");
     if (data.market_open) {
@@ -233,7 +238,16 @@ function updateIndiaStatusUI(data) {
     document.getElementById("daily-pl-pct").textContent = "0.00%";
 
     document.getElementById("buying-power-val").textContent = formatINR(data.available_cash);
-    document.getElementById("cash-val").textContent = `Margin Used: ${formatINR(data.used_margin)}`;
+    document.getElementById("cash-val").textContent = data.paper_trading
+        ? "Paper sim (live NSE prices)"
+        : `Margin Used: ${formatINR(data.used_margin || 0)}`;
+
+    const modeText = document.getElementById("mode-text");
+    if (modeText) {
+        modeText.textContent = data.paper_trading
+            ? "India Paper (live NSE)"
+            : (data.live_armed ? "India LIVE MONEY" : "India SCAN only");
+    }
 
     const marketStatusEl = document.getElementById("market-status");
     const marketBadge = document.getElementById("market-badge");
@@ -271,8 +285,21 @@ function updateCombinedStatusUI(data) {
     document.getElementById("buying-power-val").textContent = `US: ${formatUSD(data.us ? data.us.cash : 0)}`;
     document.getElementById("cash-val").textContent = `India: ${formatINR(data.india ? data.india.available_cash : 0)}`;
 
+    const modeText = document.getElementById("mode-text");
+    if (modeText) {
+        const usMode = data.us_paper !== false ? "US Paper" : "US Live";
+        const inMode = data.india_paper ? "IN Paper" : "IN Live";
+        modeText.textContent = `${usMode} + ${inMode}`;
+    }
+
     const marketStatusEl = document.getElementById("market-status");
     marketStatusEl.textContent = "Dual Market Active";
+
+    if (data.equity_history && data.equity_history.length > 0 && equityChart) {
+        equityChart.data.labels = data.equity_history.map(pt => pt.timestamp);
+        equityChart.data.datasets[0].data = data.equity_history.map(pt => pt.equity);
+        equityChart.update();
+    }
 }
 
 function renderIndiaDisabledState(msg) {

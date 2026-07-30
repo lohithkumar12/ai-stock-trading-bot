@@ -44,8 +44,15 @@ _india_equity_history = []
 
 
 def get_components():
-    """Initialize US market components (Alpaca)."""
+    """Initialize US market components (Alpaca paper/live)."""
     global _executor, _data_feed, _strategy, _risk_mgr
+    if config.IS_PLACEHOLDER_KEY:
+        if _risk_mgr is None:
+            _risk_mgr = RiskManager()
+        if _strategy is None:
+            _strategy = Strategy()
+        return None, None, _strategy, _risk_mgr
+
     if _executor is None:
         try:
             _executor = TradeExecutor()
@@ -86,13 +93,17 @@ def index():
 # ===========================================================================
 @app.route("/api/status")
 def get_status():
+    """US market status (Alpaca paper by default)."""
     executor, _, _, risk_mgr = get_components()
     account_info = executor.get_account_info() if executor else None
 
     if not account_info:
         return jsonify({
             "status": "error",
-            "message": "Unable to connect to Alpaca Account. Please verify your .env credentials."
+            "message": "Unable to connect to Alpaca. Check ALPACA_* keys (use Paper Trading keys).",
+            "india_enabled": config.INDIA_ENABLED,
+            "india_paper": config.INDIA_PAPER,
+            "live_armed": config.LIVE_CONFIRMED,
         }), 500
 
     current_equity = account_info["equity"]
@@ -106,15 +117,13 @@ def get_status():
         if len(_equity_history) > 60:
             _equity_history.pop(0)
 
-    now = datetime.now()
-    is_weekday = now.weekday() < 5
-    is_hours = 9 <= now.hour < 16 or (now.hour == 16 and now.minute == 0)
-    market_open = is_weekday and is_hours
-
     return jsonify({
         "status": "success",
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "market": "US",
+        "currency": "USD",
         "paper_trading": config.PAPER_TRADING,
+        "live_armed": config.LIVE_CONFIRMED,
         "equity": current_equity,
         "last_equity": last_equity,
         "buying_power": account_info["buying_power"],
@@ -122,9 +131,35 @@ def get_status():
         "daily_pl": round(daily_pl, 2),
         "daily_pl_pct": round(daily_pl_pct, 2),
         "kill_switch_active": risk_mgr.is_kill_switch_active if risk_mgr else False,
-        "market_open": market_open,
-        "india_enabled": config.INDIA_ENABLED
+        "market_open": _is_us_market_open_simple(),
+        "india_enabled": config.INDIA_ENABLED,
+        "india_paper": config.INDIA_PAPER,
+        "equity_history": _equity_history,
     })
+
+
+def _is_us_market_open_simple() -> bool:
+    try:
+        from zoneinfo import ZoneInfo
+        now = datetime.now(ZoneInfo("America/New_York"))
+    except Exception:
+        now = datetime.now()
+    if now.weekday() >= 5:
+        return False
+    minutes = now.hour * 60 + now.minute
+    return (9 * 60 + 30) <= minutes <= (16 * 60)
+
+
+def _is_india_market_open_simple() -> bool:
+    try:
+        from zoneinfo import ZoneInfo
+        now = datetime.now(ZoneInfo("Asia/Kolkata"))
+    except Exception:
+        now = datetime.now()
+    if now.weekday() >= 5:
+        return False
+    minutes = now.hour * 60 + now.minute
+    return (9 * 60 + 15) <= minutes <= (15 * 60 + 30)
 
 
 @app.route("/api/positions")
@@ -253,9 +288,11 @@ def get_india_status():
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "equity": equity,
         "available_cash": cash,
-        "used_margin": account_info["used_margin"],
+        "used_margin": account_info.get("used_margin", 0),
         "market_open": india_market_open,
         "logged_in": india_broker.is_logged_in,
+        "paper_trading": config.INDIA_PAPER,
+        "live_armed": config.LIVE_CONFIRMED,
         "equity_history": _india_equity_history
     })
 
@@ -362,30 +399,54 @@ def get_combined_status():
         "india": None,
         "combined_equity": 0,
         "india_enabled": config.INDIA_ENABLED,
+        "us_paper": config.PAPER_TRADING,
+        "india_paper": config.INDIA_PAPER,
+        "live_armed": config.LIVE_CONFIRMED,
+        "equity_history": [],
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
+
+    us_equity = 0.0
+    india_equity = 0.0
 
     executor, _, _, risk_mgr = get_components()
     if executor:
         us_account = executor.get_account_info()
         if us_account:
+            us_equity = float(us_account["equity"])
             result["us"] = {
                 "equity": us_account["equity"],
                 "daily_pl": round(us_account["equity"] - us_account["last_equity"], 2),
                 "cash": us_account["cash"],
             }
-            result["combined_equity"] += us_account["equity"]
+            result["combined_equity"] += us_equity
+            now_str = datetime.now(timezone.utc).strftime("%H:%M:%S")
+            if not _equity_history or _equity_history[-1]["timestamp"] != now_str:
+                _equity_history.append({"timestamp": now_str, "equity": round(us_equity, 2)})
+                if len(_equity_history) > 60:
+                    _equity_history.pop(0)
 
     if config.INDIA_ENABLED:
         india_broker, _ = get_india_components()
         if india_broker and india_broker.is_logged_in:
             india_account = india_broker.get_account_info()
             if india_account:
+                india_equity = float(india_account["equity"])
                 result["india"] = {
                     "equity": india_account["equity"],
                     "available_cash": india_account["available_cash"],
                 }
-                result["combined_equity"] += india_account["equity"]
+                result["combined_equity"] += india_equity
+                now_str = datetime.now(timezone.utc).strftime("%H:%M:%S")
+                if not _india_equity_history or _india_equity_history[-1]["timestamp"] != now_str:
+                    _india_equity_history.append(
+                        {"timestamp": now_str, "equity": round(india_equity, 2)}
+                    )
+                    if len(_india_equity_history) > 60:
+                        _india_equity_history.pop(0)
 
+    # Chart uses US equity history when available; else India
+    result["equity_history"] = _equity_history or _india_equity_history
     return jsonify(result)
 
 

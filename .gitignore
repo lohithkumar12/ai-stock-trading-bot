@@ -1,6 +1,9 @@
 # Environment secrets — NEVER commit this
 .env
 
+# Virtual India paper portfolio state
+india_paper_portfolio.json
+
 # Python caches
 __pycache__/
 *.pyc
