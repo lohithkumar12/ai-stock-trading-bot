@@ -6,11 +6,6 @@ let equityChart = null;
 let allocationChart = null;
 let currentTab = 'us'; // 'us' | 'india' | 'combined'
 
-// Scanner requests can take 20-45s. Without these guards a slow response from a
-// previously selected tab lands after the switch and repaints the wrong market.
-let tabSeq = 0;
-let fetchInFlight = false;
-
 // Initialize on DOM load
 document.addEventListener("DOMContentLoaded", () => {
     initCharts();
@@ -26,13 +21,9 @@ document.addEventListener("DOMContentLoaded", () => {
 /* ── Tab Switcher ───────────────────────────────────────────────────────── */
 function switchMarketTab(tab) {
     currentTab = tab;
-    tabSeq++;
-    fetchInFlight = false;
-
+    
     document.querySelectorAll('.tab-btn').forEach(btn => btn.classList.remove('active'));
     document.getElementById(`tab-${tab}`).classList.add('active');
-
-    showLoadingState(tab);
 
     const universeSub = document.getElementById("kpi-universe-sub");
     const scannerTitle = document.getElementById("scanner-title");
@@ -55,44 +46,19 @@ function switchMarketTab(tab) {
     fetchCurrentTabData();
 }
 
-function showLoadingState(tab) {
-    const label = tab === 'india' ? 'Loading NSE data...'
-        : tab === 'combined' ? 'Loading both markets...'
-        : 'Loading US data...';
-    document.getElementById("last-updated").textContent = label;
-    document.getElementById("equity-sub").textContent = label;
-}
-
 /* ── Fetch Data Based on Active Tab ────────────────────────────────────── */
 function fetchCurrentTabData() {
-    // Scanner endpoints outlast the 3s refresh timer, so skip overlapping runs.
-    if (fetchInFlight) return;
-
-    const seq = tabSeq;
-    const tab = currentTab;
-    fetchInFlight = true;
-
-    const done = () => {
-        if (seq === tabSeq) fetchInFlight = false;
-    };
-
-    if (tab === 'us') {
-        fetchUSData(seq).finally(done);
-    } else if (tab === 'india') {
-        fetchIndiaData(seq).finally(done);
-    } else if (tab === 'combined') {
-        fetchCombinedData(seq).finally(done);
-    } else {
-        fetchInFlight = false;
+    if (currentTab === 'us') {
+        fetchUSData();
+    } else if (currentTab === 'india') {
+        fetchIndiaData();
+    } else if (currentTab === 'combined') {
+        fetchCombinedData();
     }
 }
 
-function isStale(seq) {
-    return seq !== tabSeq;
-}
-
 /* ── US Market Fetch ────────────────────────────────────────────────────── */
-async function fetchUSData(seq) {
+async function fetchUSData() {
     try {
         const [statusRes, positionsRes, scannerRes] = await Promise.all([
             fetch('/api/status'),
@@ -100,23 +66,18 @@ async function fetchUSData(seq) {
             fetch('/api/scanner')
         ]);
 
-        if (isStale(seq)) return;
-
         if (statusRes.ok) {
             const status = await statusRes.json();
-            if (isStale(seq)) return;
             updateStatusUI(status, '$', formatUSD);
         }
 
         if (positionsRes.ok) {
             const positions = await positionsRes.json();
-            if (isStale(seq)) return;
             updatePositionsUI(positions, formatUSD, 'closePosition');
         }
 
         if (scannerRes.ok) {
             const scanner = await scannerRes.json();
-            if (isStale(seq)) return;
             updateScannerUI(scanner, formatUSD);
         }
 
@@ -126,7 +87,7 @@ async function fetchUSData(seq) {
 }
 
 /* ── India Market Fetch ─────────────────────────────────────────────────── */
-async function fetchIndiaData(seq) {
+async function fetchIndiaData() {
     try {
         const [statusRes, positionsRes, scannerRes] = await Promise.all([
             fetch('/api/india/status'),
@@ -134,11 +95,8 @@ async function fetchIndiaData(seq) {
             fetch('/api/india/scanner')
         ]);
 
-        if (isStale(seq)) return;
-
         if (statusRes.ok) {
             const status = await statusRes.json();
-            if (isStale(seq)) return;
             if (status.status === "disabled" || status.status === "error") {
                 renderIndiaDisabledState(status.message);
                 return;
@@ -150,26 +108,22 @@ async function fetchIndiaData(seq) {
 
         if (positionsRes.ok) {
             const positions = await positionsRes.json();
-            if (isStale(seq)) return;
             updatePositionsUI(positions, formatINR, 'closeIndiaPosition');
         }
 
         if (scannerRes.ok) {
             const scanner = await scannerRes.json();
-            if (isStale(seq)) return;
             updateScannerUI(scanner, formatINR);
         }
 
     } catch (err) {
         console.error("Error fetching India dashboard data:", err);
-        if (!isStale(seq)) {
-            renderIndiaDisabledState("Add Angel One keys in Render Environment");
-        }
+        renderIndiaDisabledState("Add Angel One keys in Render Environment");
     }
 }
 
 /* ── Combined View Fetch ────────────────────────────────────────────────── */
-async function fetchCombinedData(seq) {
+async function fetchCombinedData() {
     try {
         const [combinedRes, usPositionsRes, indiaPositionsRes, usScannerRes, indiaScannerRes] = await Promise.all([
             fetch('/api/combined/status'),
@@ -179,11 +133,8 @@ async function fetchCombinedData(seq) {
             fetch('/api/india/scanner')
         ]);
 
-        if (isStale(seq)) return;
-
         if (combinedRes.ok) {
             const combined = await combinedRes.json();
-            if (isStale(seq)) return;
             updateCombinedStatusUI(combined);
         }
 
@@ -198,7 +149,6 @@ async function fetchCombinedData(seq) {
             indiaPos.forEach(p => p.market_tag = '🇮🇳 India');
             allPositions = allPositions.concat(indiaPos);
         }
-        if (isStale(seq)) return;
         updatePositionsUI(allPositions, (val) => formatUSD(val), 'closePosition');
 
         let allScanner = [];
@@ -212,7 +162,6 @@ async function fetchCombinedData(seq) {
             indiaScan.forEach(s => s.symbol = `🇮🇳 ${s.symbol}`);
             allScanner = allScanner.concat(indiaScan);
         }
-        if (isStale(seq)) return;
         updateScannerUI(allScanner, formatUSD);
 
     } catch (err) {

@@ -15,7 +15,6 @@ Uses smartapi-python SDK + pyotp for TOTP auto-generation.
 """
 
 import logging
-import threading
 import time
 from datetime import datetime, timedelta
 
@@ -694,31 +693,3 @@ class IndiaBroker:
             logger.info("Angel One session terminated")
         except Exception as e:
             logger.warning(f"Angel One logout error: {e}")
-
-
-# ===========================================================================
-# Shared Instance
-# ===========================================================================
-# The dashboard and the trading loop must reuse ONE broker so they share a
-# single Angel One session, one candle cache, and one paper portfolio.
-# Two instances double the API traffic and trigger Angel rate limits.
-_shared_broker: "IndiaBroker | None" = None
-_shared_lock = threading.Lock()
-
-
-def get_shared_broker() -> "IndiaBroker | None":
-    """Return the process-wide IndiaBroker, creating it on first use."""
-    global _shared_broker
-
-    if not config.INDIA_ENABLED:
-        return None
-
-    if _shared_broker is None:
-        with _shared_lock:
-            if _shared_broker is None:
-                try:
-                    _shared_broker = IndiaBroker()
-                except Exception as e:
-                    logger.error(f"Failed to create shared IndiaBroker: {e}", exc_info=True)
-                    return None
-    return _shared_broker
