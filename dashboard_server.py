@@ -13,6 +13,7 @@ Supports:
 
 import logging
 import os
+import time
 from datetime import datetime, timezone
 import threading
 
@@ -42,6 +43,12 @@ _india_broker = None
 _india_strategy = None
 _india_equity_history = []
 
+# Scanning 12 NSE symbols costs ~12 throttled Angel One calls, far slower than
+# the dashboard's poll interval, so results are cached and reused between polls.
+_india_scanner_cache = {"timestamp": 0.0, "data": []}
+_india_scanner_lock = threading.Lock()
+INDIA_SCANNER_TTL_SEC = 60.0
+
 
 def get_components():
     """Initialize US market components (Alpaca paper/live)."""
@@ -65,18 +72,18 @@ def get_components():
 
 
 def get_india_components():
-    """Initialize India market components (Angel One)."""
+    """Reuse the process-wide Angel One broker shared with the trading loop."""
     global _india_broker, _india_strategy
     if not config.INDIA_ENABLED:
         return None, None
 
-    if _india_broker is None:
-        try:
-            from india_broker import IndiaBroker
-            _india_broker = IndiaBroker()
-            _india_strategy = Strategy()  # Same strategy engine
-        except Exception as e:
-            logger.error(f"Error initializing India dashboard components: {e}")
+    try:
+        from india_broker import get_shared_broker
+        _india_broker = get_shared_broker()
+        if _india_strategy is None:
+            _india_strategy = Strategy()
+    except Exception as e:
+        logger.error(f"Error initializing India dashboard components: {e}")
     return _india_broker, _india_strategy
 
 
@@ -340,6 +347,28 @@ def get_india_scanner():
     if not india_broker or not india_broker.is_logged_in or not strategy:
         return jsonify([])
 
+    now_ts = time.time()
+    if (
+        _india_scanner_cache["data"]
+        and now_ts - _india_scanner_cache["timestamp"] < INDIA_SCANNER_TTL_SEC
+    ):
+        return jsonify(_india_scanner_cache["data"])
+
+    # Only one scan may run at a time; concurrent polls reuse the last result.
+    if not _india_scanner_lock.acquire(blocking=False):
+        return jsonify(_india_scanner_cache["data"])
+
+    try:
+        scanner_results = _scan_india_universe(india_broker, strategy)
+        _india_scanner_cache["data"] = scanner_results
+        _india_scanner_cache["timestamp"] = time.time()
+    finally:
+        _india_scanner_lock.release()
+
+    return jsonify(scanner_results)
+
+
+def _scan_india_universe(india_broker, strategy) -> list:
     scanner_results = []
     for symbol in config.INDIA_STOCK_UNIVERSE:
         try:
@@ -373,7 +402,7 @@ def get_india_scanner():
                 "signal": "ERROR"
             })
 
-    return jsonify(scanner_results)
+    return scanner_results
 
 
 @app.route("/api/india/close_position/<symbol>", methods=["POST"])

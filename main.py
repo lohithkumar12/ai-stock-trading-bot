@@ -213,14 +213,13 @@ def run_us_loop(data_feed, strategy, risk_mgr, executor):
 
 
 def run_india_loop(strategy, risk_mgr):
-    from india_broker import IndiaBroker
+    from india_broker import get_shared_broker
 
     logger.info("[INDIA] India Market trading loop starting (24/7 process)...")
 
-    try:
-        india_broker = IndiaBroker()
-    except Exception as e:
-        logger.error(f"[INDIA] Failed to initialize India broker: {e}")
+    india_broker = get_shared_broker()
+    if india_broker is None:
+        logger.error("[INDIA] Failed to initialize India broker")
         return
 
     if not india_broker.is_logged_in:
