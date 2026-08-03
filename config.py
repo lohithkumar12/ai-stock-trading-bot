@@ -126,12 +126,13 @@ INDIA_CORRELATION_CLUSTERS: dict[str, list[str]] = {
 
 # ===========================================================================
 # Strategy Selection
-#   trend_pullback  — PRIMARY (default): trend filter + pullback entry
-#   mean_reversion  — SECONDARY: BB+RSI only in ranging markets (low ADX)
-#   relative_strength — optional RS filter layered on primary/secondary
+#   trend_pullback   — PRIMARY: trend filter + pullback entry
+#   mean_reversion   — BB+RSI only in ranging markets (low ADX)
+#   regime_adaptive  — ADX switches between trend_pullback and mean_reversion
+#   + USE_RELATIVE_STRENGTH — optional RS top-N gate on BUY
 # ===========================================================================
 STRATEGY_NAME: str = os.getenv("STRATEGY_NAME", "trend_pullback").strip().lower()
-USE_RELATIVE_STRENGTH: bool = _env_bool("USE_RELATIVE_STRENGTH", "false")
+USE_RELATIVE_STRENGTH: bool = _env_bool("USE_RELATIVE_STRENGTH", "true")
 RS_TOP_N: int = _env_int("RS_TOP_N", "5")
 RS_LOOKBACK_BARS: int = _env_int("RS_LOOKBACK_BARS", "60")  # ~multi-week on 1H
 

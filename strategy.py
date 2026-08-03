@@ -14,7 +14,10 @@ Selectable via config.STRATEGY_NAME:
      - Only when market is ranging (ADX below threshold)
      - Disabled in strong trends
 
-  C) relative_strength (optional filter)
+  C) regime_adaptive
+     - ADX high → trend_pullback; ADX low → mean_reversion
+
+  D) relative_strength (optional filter)
      - When USE_RELATIVE_STRENGTH=true, only trade top-N names
        by multi-week performance within the universe
 
@@ -373,6 +376,41 @@ class MeanReversionStrategy(BaseStrategy):
 
 
 # ---------------------------------------------------------------------------
+# C) Regime Adaptive — trend rules in trends, MR in ranges
+# ---------------------------------------------------------------------------
+class RegimeAdaptiveStrategy(BaseStrategy):
+    """
+    Uses ADX to pick the playbook:
+      ADX >= adx_range_max  → TrendPullback (ride momentum after pullbacks)
+      ADX <  adx_range_max  → MeanReversion (fade extremes in ranges)
+    """
+
+    name = "regime_adaptive"
+
+    def __init__(self, params: MarketParams):
+        super().__init__(params)
+        self._trend = TrendPullbackStrategy(params)
+        self._mr = MeanReversionStrategy(params)
+        logger.info(
+            f"[{params.market}] RegimeAdaptive | "
+            f"ADX>={params.adx_range_max}→trend else→mean_reversion"
+        )
+
+    def generate_signal(self, df: pd.DataFrame, symbol: str) -> str:
+        if config.TEST_MODE:
+            return "HOLD"
+        need = max(self.p.sma_slow, self.p.adx_period) + 2
+        if len(df) < need:
+            return "HOLD"
+        adx = df.iloc[-1].get("ADX")
+        if adx is None or pd.isna(adx):
+            return "HOLD"
+        if float(adx) >= self.p.adx_range_max:
+            return self._trend.generate_signal(df, symbol)
+        return self._mr.generate_signal(df, symbol)
+
+
+# ---------------------------------------------------------------------------
 # Relative Strength filter (optional overlay)
 # ---------------------------------------------------------------------------
 class RelativeStrengthFilter:
@@ -461,6 +499,8 @@ def create_strategy(
 
     if strategy_name in ("mean_reversion", "mean-reversion", "mr"):
         base: BaseStrategy = MeanReversionStrategy(params)
+    elif strategy_name in ("regime_adaptive", "regime", "adaptive", "hybrid"):
+        base = RegimeAdaptiveStrategy(params)
     else:
         # Default / unknown → trend_pullback (safe primary)
         if strategy_name not in ("trend_pullback", "trend-pullback", "tp", "primary"):

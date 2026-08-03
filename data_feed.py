@@ -45,6 +45,9 @@ class DataFeed:
         self._last_call_time = 0.0
         logger.info("DataFeed initialized -- connected to Alpaca Data API.")
 
+    def _cache_key(self, symbol: str, timeframe: str | None = None) -> str:
+        return f"{symbol}|{timeframe or config.TIMEFRAME}"
+
     def _throttle(self) -> None:
         elapsed = time.time() - self._last_call_time
         if elapsed < MIN_CALL_GAP_SEC:
@@ -65,7 +68,8 @@ class DataFeed:
 
     def get_historical_bars(self, symbol: str) -> pd.DataFrame | None:
         now_ts = time.time()
-        cached = self._bar_cache.get(symbol)
+        cache_key = self._cache_key(symbol)
+        cached = self._bar_cache.get(cache_key)
         if cached is not None:
             cache_time, cached_df = cached
             if now_ts - cache_time < BAR_CACHE_TTL_SEC:
@@ -75,9 +79,9 @@ class DataFeed:
             timeframe = TIMEFRAME_MAP.get(config.TIMEFRAME, TimeFrame.Hour)
 
             if timeframe == TimeFrame.Day:
-                calendar_days = int(config.LOOKBACK_BARS * 1.6)
+                calendar_days = int(config.LOOKBACK_BARS * 1.6) + 60
             elif timeframe == TimeFrame.Hour:
-                calendar_days = int(config.LOOKBACK_BARS / 6.5 * 2.0)
+                calendar_days = int(config.LOOKBACK_BARS / 6.5 * 2.0) + 20
             else:
                 calendar_days = int(config.LOOKBACK_BARS / (6.5 * 60) * 2.0) + 10
 
@@ -121,7 +125,7 @@ class DataFeed:
                 df = df.xs(symbol, level="symbol")
 
             df = df.tail(config.LOOKBACK_BARS)
-            self._bar_cache[symbol] = (time.time(), df.copy())
+            self._bar_cache[cache_key] = (time.time(), df.copy())
 
             logger.info(
                 f"Fetched {len(df)} bars for {symbol} "
