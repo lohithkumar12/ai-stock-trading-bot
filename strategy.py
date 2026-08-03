@@ -411,6 +411,89 @@ class RegimeAdaptiveStrategy(BaseStrategy):
 
 
 # ---------------------------------------------------------------------------
+# D) Breakout / Momentum (Donchian-style)
+# ---------------------------------------------------------------------------
+class BreakoutStrategy(BaseStrategy):
+    """
+    Enter when close breaks above the prior N-bar high (default SMA_FAST window),
+    still above SMA200, with volume confirmation. Exit on RSI/BB overbought or
+    close back below SMA_FAST.
+    """
+
+    name = "breakout"
+
+    def __init__(self, params: MarketParams, channel: int | None = None):
+        super().__init__(params)
+        self.channel = channel or max(params.sma_fast, 20)
+        logger.info(
+            f"[{params.market}] Breakout | channel={self.channel} SMA{params.sma_slow}"
+        )
+
+    def generate_signal(self, df: pd.DataFrame, symbol: str) -> str:
+        if config.TEST_MODE:
+            return "HOLD"
+        need = max(self.p.sma_slow, self.channel) + 2
+        if len(df) < need:
+            return "HOLD"
+
+        sma_s = f"SMA_{self.p.sma_slow}"
+        sma_f = f"SMA_{self.p.sma_fast}"
+        rsi_c = f"RSI_{self.p.rsi_period}"
+        latest = df.iloc[-1]
+        if any(pd.isna(latest.get(c)) for c in (sma_s, sma_f, rsi_c, "VOL_AVG", "BBU")):
+            return "HOLD"
+
+        prior_high = float(df["high"].iloc[-(self.channel + 1) : -1].max())
+        close = float(latest["close"])
+        vol_ok = float(latest.get("volume") or 0) > float(latest["VOL_AVG"])
+        uptrend = close > float(latest[sma_s])
+
+        if config.STRICT_SELL:
+            if float(latest[rsi_c]) > self.p.rsi_sell and close >= float(latest["BBU"]):
+                return "SELL"
+        else:
+            if float(latest[rsi_c]) > self.p.rsi_sell or close >= float(latest["BBU"]):
+                return "SELL"
+        if close < float(latest[sma_f]):
+            return "SELL"
+
+        if uptrend and close > prior_high and vol_ok:
+            logger.info(f"[BUY SIGNAL] {symbol} — Breakout above {prior_high:.2f}")
+            return "BUY"
+        return "HOLD"
+
+
+def snapshot_signal(strategy: BaseStrategy, df: pd.DataFrame, symbol: str) -> dict:
+    """Dashboard-friendly signal payload with a short reason."""
+    signal = strategy.generate_signal(df, symbol)
+    latest = df.iloc[-1]
+    rsi_c = f"RSI_{strategy.p.rsi_period}"
+    price = float(latest["close"])
+    rsi = latest.get(rsi_c)
+    adx = latest.get("ADX")
+    reason = "no setup"
+    if signal == "BUY":
+        reason = f"{strategy.name} entry"
+    elif signal == "SELL":
+        reason = "overbought / exit rule"
+    elif rsi is not None and not pd.isna(rsi) and float(rsi) > strategy.p.rsi_sell:
+        reason = "HOLD — elevated RSI, waiting"
+    elif adx is not None and not pd.isna(adx):
+        reason = f"HOLD — scanning ({strategy.name}, ADX={float(adx):.0f})"
+    else:
+        reason = f"HOLD — scanning ({strategy.name})"
+    return {
+        "symbol": symbol,
+        "signal": signal,
+        "price": round(price, 2),
+        "rsi": round(float(rsi), 1) if rsi is not None and not pd.isna(rsi) else None,
+        "adx": round(float(adx), 1) if adx is not None and not pd.isna(adx) else None,
+        "reason": reason,
+        "strategy": strategy.name,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Relative Strength filter (optional overlay)
 # ---------------------------------------------------------------------------
 class RelativeStrengthFilter:
@@ -501,6 +584,8 @@ def create_strategy(
         base: BaseStrategy = MeanReversionStrategy(params)
     elif strategy_name in ("regime_adaptive", "regime", "adaptive", "hybrid"):
         base = RegimeAdaptiveStrategy(params)
+    elif strategy_name in ("breakout", "donchian", "momentum"):
+        base = BreakoutStrategy(params)
     else:
         # Default / unknown → trend_pullback (safe primary)
         if strategy_name not in ("trend_pullback", "trend-pullback", "tp", "primary"):

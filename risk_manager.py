@@ -315,6 +315,11 @@ class RiskManager:
     def is_kill_switch_active(self) -> bool:
         return self._kill_switch_active
 
+    def activate_kill_switch(self, reason: str = "manual"):
+        self._kill_switch_active = True
+        self._kill_switch_day = datetime.now().date()
+        logger.critical(f"[{self.market}] Kill switch ACTIVATED ({reason})")
+
     def reset_kill_switch(self):
         """Reset only for a new trading day (caller should gate by date)."""
         self._kill_switch_active = False

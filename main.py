@@ -22,6 +22,10 @@ from strategy import create_strategy, RelativeStrengthFilter
 from risk_manager import RiskManager
 from dashboard_server import start_dashboard_in_background
 import trade_journal
+import bot_state
+import alerts
+from filters import regime_allows, mtf_allows, fetch_daily_bars
+from strategy import snapshot_signal
 
 try:
     from zoneinfo import ZoneInfo
@@ -179,7 +183,13 @@ def run_us_loop(data_feed, strategy, risk_mgr, executor, rs_filter=None):
 
             if risk_mgr.check_daily_drawdown(current_equity, sod_equity):
                 logger.critical("[US KILL-SWITCH] Trading PAUSED (daily drawdown).")
+                alerts.kill_switch_alert("US", True)
                 executor.cancel_all_open_orders()
+                time.sleep(config.LOOP_INTERVAL_SEC)
+                continue
+
+            if risk_mgr.is_kill_switch_active:
+                logger.critical("[US KILL-SWITCH] Active — skipping entries this cycle.")
                 time.sleep(config.LOOP_INTERVAL_SEC)
                 continue
 
@@ -194,6 +204,10 @@ def run_us_loop(data_feed, strategy, risk_mgr, executor, rs_filter=None):
                     bar_cache[symbol] = strategy.compute_indicators(df)
             _refresh_rs_filter(rs_filter, bar_cache)
 
+            regime_ok = regime_allows("US", bar_cache)
+            daily_cache: dict = {}
+            signal_rows = []
+
             for symbol in config.STOCK_UNIVERSE:
                 logger.info(f"[US] -- Scanning {symbol} " + "-" * (40 - len(symbol)))
 
@@ -202,10 +216,12 @@ def run_us_loop(data_feed, strategy, risk_mgr, executor, rs_filter=None):
                     logger.warning(f"[US] {symbol}: No data — skipping.")
                     continue
 
-                signal = strategy.generate_signal(df, symbol)
+                snap = snapshot_signal(strategy, df, symbol)
+                signal_rows.append(snap)
+                signal = snap["signal"]
                 atr = strategy.latest_atr(df)
 
-                # Trailing management for open positions
+                # Trailing management for open positions (+ broker stop sync)
                 if symbol in current_positions:
                     pos = current_positions[symbol]
                     if symbol not in risk_mgr._trade_meta:
@@ -213,12 +229,18 @@ def run_us_loop(data_feed, strategy, risk_mgr, executor, rs_filter=None):
                         risk_mgr.register_trade(
                             symbol, pos["avg_entry_price"], sl0, atr
                         )
-                    risk_mgr.update_trailing_stop(
+                    new_stop = risk_mgr.update_trailing_stop(
                         symbol, pos["current_price"], atr
                     )
+                    if new_stop is not None:
+                        executor.sync_stop_loss(symbol, new_stop)
 
                 if signal == "BUY":
-                    if not tradable_window:
+                    if not tradable_window or not regime_ok:
+                        continue
+                    if symbol not in daily_cache and config.USE_MTF_FILTER:
+                        daily_cache[symbol] = fetch_daily_bars(data_feed, symbol)
+                    if not mtf_allows(symbol, daily_cache.get(symbol)):
                         continue
                     if not risk_mgr.is_position_allowed(symbol, current_positions):
                         continue
@@ -268,6 +290,7 @@ def run_us_loop(data_feed, strategy, risk_mgr, executor, rs_filter=None):
                             strategy=strategy.name,
                             meta={"atr": atr},
                         )
+                        alerts.trade_alert("US", "BUY", symbol, f"qty={qty} @{limit_price}")
                         current_positions[symbol] = {"qty": qty}
 
                 elif signal == "SELL" and symbol in current_positions:
@@ -278,7 +301,10 @@ def run_us_loop(data_feed, strategy, risk_mgr, executor, rs_filter=None):
                             "US", symbol, float(px), reason="signal_sell"
                         )
                         risk_mgr.clear_trade(symbol)
+                        alerts.trade_alert("US", "SELL", symbol, f"@{px}")
 
+            bot_state.publish_signals("US", signal_rows)
+            bot_state.mark_healthy("US")
             log_portfolio_summary(executor, "US")
 
             elapsed = time.time() - loop_start
@@ -290,6 +316,8 @@ def run_us_loop(data_feed, strategy, risk_mgr, executor, rs_filter=None):
             raise
         except Exception as e:
             logger.error(f"[US ERROR] {e}", exc_info=True)
+            bot_state.mark_cycle("US", error=str(e))
+            alerts.health_alert(f"US loop error: {e}")
             time.sleep(config.LOOP_INTERVAL_SEC)
 
 
@@ -364,20 +392,23 @@ def run_india_loop(strategy, risk_mgr, rs_filter=None):
             current_equity = account["equity"]
             sod = account.get("last_equity") or start_of_day_equity
             if sod is None or sod <= 0:
-                sod = current_equity
-                start_of_day_equity = current_equity
+                sod = bot_state.india_sod_equity(current_equity)
+                start_of_day_equity = sod
             else:
                 start_of_day_equity = sod
+                bot_state.india_sod_equity(sod)
 
             trade_journal.snapshot_equity("INDIA", current_equity)
 
             if risk_mgr.check_daily_drawdown(current_equity, start_of_day_equity):
                 logger.critical("[INDIA KILL-SWITCH] Trading PAUSED (daily drawdown).")
+                alerts.kill_switch_alert("INDIA", True)
                 india_broker.cancel_all_open_orders()
                 time.sleep(config.INDIA_LOOP_INTERVAL_SEC)
                 continue
 
             if risk_mgr.is_kill_switch_active:
+                logger.critical("[INDIA KILL-SWITCH] Active — skipping entries.")
                 time.sleep(config.INDIA_LOOP_INTERVAL_SEC)
                 continue
 
@@ -394,6 +425,9 @@ def run_india_loop(strategy, risk_mgr, rs_filter=None):
                     bar_cache[symbol] = strategy.compute_indicators(df)
             _refresh_rs_filter(rs_filter, bar_cache)
 
+            regime_ok = regime_allows("INDIA", bar_cache)
+            signal_rows = []
+
             for symbol in config.INDIA_STOCK_UNIVERSE:
                 logger.info(f"[INDIA] -- Scanning {symbol} " + "-" * (40 - len(symbol)))
 
@@ -402,11 +436,13 @@ def run_india_loop(strategy, risk_mgr, rs_filter=None):
                     logger.warning(f"[INDIA] {symbol}: No data — skipping.")
                     continue
 
-                signal = strategy.generate_signal(df, symbol)
+                snap = snapshot_signal(strategy, df, symbol)
+                signal_rows.append(snap)
+                signal = snap["signal"]
                 atr = strategy.latest_atr(df)
 
                 if signal == "BUY":
-                    if not tradable_window:
+                    if not tradable_window or not regime_ok:
                         continue
                     if not risk_mgr.is_position_allowed(symbol, current_positions):
                         continue
@@ -455,6 +491,7 @@ def run_india_loop(strategy, risk_mgr, rs_filter=None):
                             strategy=strategy.name,
                             meta={"atr": atr, "order_id": order_id},
                         )
+                        alerts.trade_alert("INDIA", "BUY", symbol, f"qty={qty} @{limit_price}")
                         current_positions[symbol] = {"qty": qty}
 
                 elif signal == "SELL" and symbol in current_positions:
@@ -465,7 +502,10 @@ def run_india_loop(strategy, risk_mgr, rs_filter=None):
                             "INDIA", symbol, float(px), reason="signal_sell"
                         )
                         risk_mgr.clear_trade(symbol)
+                        alerts.trade_alert("INDIA", "SELL", symbol, f"@{px}")
 
+            bot_state.publish_signals("INDIA", signal_rows)
+            bot_state.mark_healthy("INDIA")
             log_india_portfolio_summary(india_broker, "INDIA")
 
             elapsed = time.time() - loop_start
@@ -477,6 +517,8 @@ def run_india_loop(strategy, risk_mgr, rs_filter=None):
             raise
         except Exception as e:
             logger.error(f"[INDIA ERROR] {e}", exc_info=True)
+            bot_state.mark_cycle("INDIA", error=str(e))
+            alerts.health_alert(f"INDIA loop error: {e}")
             time.sleep(config.INDIA_LOOP_INTERVAL_SEC)
 
 

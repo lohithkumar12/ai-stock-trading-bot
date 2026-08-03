@@ -104,6 +104,11 @@ class DataFeed:
                     last_err = e
                     if self._is_rate_limit(e) and attempt < MAX_RETRIES - 1:
                         wait = min(8.0, 1.0 * (2 ** attempt))
+                        try:
+                            import bot_state
+                            bot_state.note_alpaca_429()
+                        except Exception:
+                            pass
                         logger.warning(
                             f"Alpaca rate limit for {symbol}; retry in {wait:.1f}s "
                             f"(attempt {attempt + 1}/{MAX_RETRIES})"

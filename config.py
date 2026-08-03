@@ -129,6 +129,7 @@ INDIA_CORRELATION_CLUSTERS: dict[str, list[str]] = {
 #   trend_pullback   — PRIMARY: trend filter + pullback entry
 #   mean_reversion   — BB+RSI only in ranging markets (low ADX)
 #   regime_adaptive  — ADX switches between trend_pullback and mean_reversion
+#   breakout         — Donchian-style high breakout with volume
 #   + USE_RELATIVE_STRENGTH — optional RS top-N gate on BUY
 # ===========================================================================
 STRATEGY_NAME: str = os.getenv("STRATEGY_NAME", "trend_pullback").strip().lower()
@@ -202,6 +203,25 @@ ALLOW_MARKET_ENTRIES: bool = _env_bool("ALLOW_MARKET_ENTRIES", "false")
 # US limit fill timeout → cancel / requote
 LIMIT_FILL_TIMEOUT_SEC: int = _env_int("LIMIT_FILL_TIMEOUT_SEC", "120")
 LIMIT_REQUOTE_MAX: int = _env_int("LIMIT_REQUOTE_MAX", "2")
+
+# Sync software trailing stops onto Alpaca stop orders
+SYNC_BROKER_STOPS: bool = _env_bool("SYNC_BROKER_STOPS", "true")
+
+# Multi-timeframe: require daily close > SMA200 for US 1H buys
+USE_MTF_FILTER: bool = _env_bool("USE_MTF_FILTER", "true")
+# Index regime: only buy stocks when SPY (US) / NIFTY proxy is in uptrend
+USE_REGIME_FILTER: bool = _env_bool("USE_REGIME_FILTER", "true")
+REGIME_SYMBOL_US: str = os.getenv("REGIME_SYMBOL_US", "SPY").strip().upper()
+REGIME_SYMBOL_INDIA: str = os.getenv("REGIME_SYMBOL_INDIA", "RELIANCE").strip().upper()
+
+# Backtest realism
+BT_COMMISSION_PCT: float = _env_float("BT_COMMISSION_PCT", "0.001")  # 0.1% round-trip approx
+BT_SLIPPAGE_PCT: float = _env_float("BT_SLIPPAGE_PCT", "0.0005")  # 5 bps per side
+
+# Alerts (optional)
+TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+ALERT_WEBHOOK_URL: str = os.getenv("ALERT_WEBHOOK_URL", "").strip()
 
 # ===========================================================================
 # Trade Journal

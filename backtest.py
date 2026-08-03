@@ -43,7 +43,7 @@ class BacktestResult:
     equity_curve: list[float] = field(default_factory=list)
 
 
-COMPARE_STRATEGIES = ("trend_pullback", "mean_reversion", "regime_adaptive")
+COMPARE_STRATEGIES = ("trend_pullback", "mean_reversion", "regime_adaptive", "breakout")
 
 
 def load_csv(path: str) -> pd.DataFrame:
@@ -139,6 +139,8 @@ def run_backtest(
     risk_pct = risk_per_trade if risk_per_trade is not None else config.RISK_PER_TRADE
     atr_mult = atr_stop_mult if atr_stop_mult is not None else config.ATR_STOP_MULT
     tp_r = take_profit_r if take_profit_r is not None else config.TAKE_PROFIT_R
+    slip = float(getattr(config, "BT_SLIPPAGE_PCT", 0.0005) or 0)
+    commission = float(getattr(config, "BT_COMMISSION_PCT", 0.001) or 0)
 
     # Quiet per-bar strategy logs during backtest
     strat_logger = logging.getLogger("strategy")
@@ -179,16 +181,17 @@ def run_backtest(
                 low = float(bar["low"])
                 high = float(bar["high"])
                 if low <= position["stop"]:
-                    exit_px = position["stop"]
+                    exit_px = position["stop"] * (1 - slip)
                 elif high >= position["tp"]:
-                    exit_px = position["tp"]
+                    exit_px = position["tp"] * (1 - slip)
                 else:
                     sig = strategy.generate_signal(window, symbol)
                     if sig == "SELL":
-                        exit_px = price
+                        exit_px = price * (1 - slip)
 
                 if exit_px is not None:
                     pnl = (exit_px - position["entry"]) * position["qty"]
+                    pnl -= abs(position["entry"] * position["qty"]) * commission
                     equity += pnl
                     trade_count += 1
                     if pnl >= 0:
@@ -202,25 +205,26 @@ def run_backtest(
             else:
                 sig = strategy.generate_signal(window, symbol)
                 if sig == "BUY" and atr and atr > 0:
-                    stop = price - atr_mult * atr
-                    stop_dist = price - stop
+                    fill = price * (1 + slip)
+                    stop = fill - atr_mult * atr
+                    stop_dist = fill - stop
                     if stop_dist <= 0:
                         continue
                     risk_budget = equity * risk_pct
                     qty = int(risk_budget // stop_dist)
-                    max_by_pct = int((equity * config.MAX_POSITION_PCT) // price)
+                    max_by_pct = int((equity * config.MAX_POSITION_PCT) // fill)
                     qty = min(qty, max_by_pct, config.MAX_SHARES_PER_ORDER)
                     if qty <= 0:
                         continue
-                    tp = price + tp_r * stop_dist
+                    tp = fill + tp_r * stop_dist
                     position = {
                         "qty": qty,
-                        "entry": price,
+                        "entry": fill,
                         "stop": stop,
                         "initial_stop": stop,
                         "tp": tp,
                         "atr": atr,
-                        "peak": price,
+                        "peak": fill,
                     }
 
             peak = max(peak, equity)

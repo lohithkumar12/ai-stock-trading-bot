@@ -26,6 +26,8 @@ from strategy import Strategy, create_strategy
 from risk_manager import RiskManager
 from execution import TradeExecutor
 import trade_journal
+import bot_state
+import alerts
 
 logger = logging.getLogger(__name__)
 
@@ -229,6 +231,22 @@ def get_positions():
 def get_scanner():
     global _us_scanner_cache
 
+    cached_signals = bot_state.get_signals("US", max_age_sec=max(600, config.LOOP_INTERVAL_SEC * 3))
+    if cached_signals:
+        return jsonify([
+            {
+                "symbol": s["symbol"],
+                "price": s.get("price") or 0.0,
+                "rsi": s.get("rsi"),
+                "adx": s.get("adx"),
+                "signal": s.get("signal", "HOLD"),
+                "reason": s.get("reason", ""),
+                "strategy": s.get("strategy"),
+                "source": "bot_cache",
+            }
+            for s in cached_signals
+        ])
+
     now = time.time()
     if _us_scanner_cache and (now - _us_scanner_cache[0]) < SCANNER_CACHE_TTL_SEC:
         return jsonify(_us_scanner_cache[1])
@@ -336,10 +354,17 @@ def get_india_status():
     india_market_open = is_weekday and market_open_time <= now_ist <= market_close_time
 
     india_risk = get_india_risk()
+    sod = bot_state.india_sod_equity(equity)
+    last_eq = float(account_info.get("last_equity") or sod)
+    daily_pl = equity - last_eq
+    daily_pl_pct = (daily_pl / last_eq * 100) if last_eq else 0.0
     return jsonify({
         "status": "success",
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "equity": equity,
+        "last_equity": last_eq,
+        "daily_pl": round(daily_pl, 2),
+        "daily_pl_pct": round(daily_pl_pct, 2),
         "available_cash": cash,
         "used_margin": account_info.get("used_margin", 0),
         "market_open": india_market_open,
@@ -404,6 +429,22 @@ def get_india_scanner():
 
     if not config.INDIA_ENABLED:
         return jsonify([])
+
+    cached_signals = bot_state.get_signals("INDIA", max_age_sec=max(600, config.INDIA_LOOP_INTERVAL_SEC * 3))
+    if cached_signals:
+        return jsonify([
+            {
+                "symbol": s["symbol"],
+                "price": s.get("price") or 0.0,
+                "rsi": s.get("rsi"),
+                "adx": s.get("adx"),
+                "signal": s.get("signal", "HOLD"),
+                "reason": s.get("reason", ""),
+                "strategy": s.get("strategy"),
+                "source": "bot_cache",
+            }
+            for s in cached_signals
+        ])
 
     now = time.time()
     if _india_scanner_cache and (now - _india_scanner_cache[0]) < SCANNER_CACHE_TTL_SEC:
@@ -614,18 +655,51 @@ def close_position(symbol):
 
 @app.route("/api/toggle_kill_switch", methods=["POST"])
 def toggle_kill_switch():
-    _, _, _, risk_mgr = get_components()
-    if not risk_mgr:
+    _, _, _, us_risk = get_components()
+    india_risk = get_india_risk()
+    if not us_risk and not india_risk:
         return jsonify({"status": "error", "message": "Risk manager not available"}), 500
 
-    if risk_mgr.is_kill_switch_active:
-        risk_mgr.reset_kill_switch()
-        state = "reset"
+    any_active = bool(
+        (us_risk and us_risk.is_kill_switch_active)
+        or (india_risk and india_risk.is_kill_switch_active)
+    )
+    if any_active:
+        if us_risk:
+            us_risk.reset_kill_switch()
+        if india_risk:
+            india_risk.reset_kill_switch()
+        alerts.kill_switch_alert("ALL", False)
+        state = "reset for US and India"
     else:
-        risk_mgr._kill_switch_active = True
-        state = "activated"
+        if us_risk:
+            us_risk.activate_kill_switch("dashboard")
+        if india_risk:
+            india_risk.activate_kill_switch("dashboard")
+        alerts.kill_switch_alert("ALL", True)
+        state = "activated for US and India"
 
     return jsonify({"status": "success", "message": f"Kill switch {state}"})
+
+
+@app.route("/api/health")
+def get_health():
+    h = bot_state.get_health()
+    us_risk = get_components()[3]
+    india_risk = get_india_risk()
+    h["us_kill_switch"] = bool(us_risk.is_kill_switch_active) if us_risk else False
+    h["india_kill_switch"] = bool(india_risk.is_kill_switch_active) if india_risk else False
+    h["us_enabled"] = config.US_ENABLED
+    h["india_enabled"] = config.INDIA_ENABLED
+    return jsonify(h)
+
+
+@app.route("/api/equity_curves")
+def get_equity_curves():
+    return jsonify({
+        "us": trade_journal.equity_curve("US", limit=120),
+        "india": trade_journal.equity_curve("INDIA", limit=120),
+    })
 
 
 def run_dashboard_server(host="0.0.0.0", port=None):

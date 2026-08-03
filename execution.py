@@ -19,8 +19,10 @@ from alpaca.trading.requests import (
     LimitOrderRequest,
     TakeProfitRequest,
     StopLossRequest,
+    ReplaceOrderRequest,
+    GetOrdersRequest,
 )
-from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass, QueryOrderStatus
 
 import config
 
@@ -239,6 +241,64 @@ class TradeExecutor:
             return True
         except Exception as e:
             logger.error(f"Failed to close position for {symbol}: {e}", exc_info=True)
+            return False
+
+    def sync_stop_loss(self, symbol: str, new_stop: float) -> bool:
+        """
+        Push a higher trailing stop onto the open Alpaca stop-loss child order.
+        Only moves stop up (longs). No-op if SYNC_BROKER_STOPS is false.
+        """
+        if not config.SYNC_BROKER_STOPS:
+            return False
+        try:
+            orders = self.client.get_orders(
+                filter=GetOrdersRequest(status=QueryOrderStatus.OPEN, nested=True)
+            )
+            new_stop = round(float(new_stop), 2)
+            updated = False
+            for order in orders:
+                if getattr(order, "symbol", None) != symbol:
+                    continue
+                otype = str(getattr(order, "order_type", getattr(order, "type", ""))).lower()
+                side = str(getattr(order, "side", "")).lower()
+                if "sell" not in side:
+                    continue
+                if "stop" not in otype and not getattr(order, "stop_price", None):
+                    continue
+                cur = float(getattr(order, "stop_price", 0) or 0)
+                if new_stop <= cur + 0.01:
+                    continue
+                try:
+                    self.client.replace_order_by_id(
+                        order_id=str(order.id),
+                        order_data=ReplaceOrderRequest(stop_price=new_stop),
+                    )
+                    logger.info(f"{symbol}: broker stop raised {cur:.2f} → {new_stop:.2f}")
+                    updated = True
+                except Exception as e:
+                    logger.warning(f"{symbol}: stop replace failed ({e})")
+                    try:
+                        qty = int(float(getattr(order, "qty", 0) or 0))
+                        if qty <= 0:
+                            continue
+                        self.client.cancel_order_by_id(str(order.id))
+                        from alpaca.trading.requests import StopOrderRequest
+                        self.client.submit_order(
+                            StopOrderRequest(
+                                symbol=symbol,
+                                qty=qty,
+                                side=OrderSide.SELL,
+                                time_in_force=TimeInForce.GTC,
+                                stop_price=new_stop,
+                            )
+                        )
+                        logger.info(f"{symbol}: resubmitted stop @ {new_stop:.2f}")
+                        updated = True
+                    except Exception as e2:
+                        logger.error(f"{symbol}: stop sync failed: {e2}")
+            return updated
+        except Exception as e:
+            logger.error(f"sync_stop_loss({symbol}) error: {e}", exc_info=True)
             return False
 
     def cancel_all_open_orders(self) -> bool:

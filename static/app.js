@@ -12,9 +12,13 @@ document.addEventListener("DOMContentLoaded", () => {
     fetchLiveData();
     fetchScannerData();
     fetchLogs();
+    fetchTrades();
+    fetchHealth();
     setInterval(fetchLiveData, 3000);
     setInterval(fetchScannerData, 60000);
     setInterval(fetchLogs, 5000);
+    setInterval(fetchTrades, 15000);
+    setInterval(fetchHealth, 10000);
 });
 
 function isLiveStale(gen) {
@@ -63,6 +67,7 @@ function switchMarketTab(tab) {
     clearMarketPanels(tab);
     fetchLiveData();
     fetchScannerData();
+    fetchTrades();
 }
 
 function clearMarketPanels(tab) {
@@ -266,8 +271,14 @@ function updateIndiaStatusUI(data) {
     document.getElementById("equity-val").textContent = formatINR(data.equity);
     document.getElementById("equity-sub").textContent = "Angel One Account";
 
-    document.getElementById("daily-pl-val").textContent = "₹0.00";
-    document.getElementById("daily-pl-pct").textContent = "0.00%";
+    const dailyPlEl = document.getElementById("daily-pl-val");
+    const dailyPctEl = document.getElementById("daily-pl-pct");
+    const pl = data.daily_pl != null ? data.daily_pl : 0;
+    const plPct = data.daily_pl_pct != null ? data.daily_pl_pct : 0;
+    dailyPlEl.textContent = `${pl >= 0 ? '+' : ''}${formatINR(pl)}`;
+    dailyPctEl.textContent = `${plPct >= 0 ? '+' : ''}${Number(plPct).toFixed(2)}%`;
+    dailyPlEl.style.color = pl >= 0 ? "var(--success)" : "var(--danger)";
+    dailyPctEl.className = pl >= 0 ? "kpi-badge positive" : "kpi-badge negative";
 
     document.getElementById("buying-power-val").textContent = formatINR(data.available_cash);
     document.getElementById("cash-val").textContent = data.paper_trading
@@ -377,6 +388,7 @@ function updateScannerUI(scannerList, formatter) {
                         <span>14-RSI:</span>
                         <span class="ind-val" style="${rsiStyle}">${item.rsi != null ? item.rsi : '-'}</span>
                     </div>
+                    ${item.reason ? `<div class="ind-row"><span>Why:</span><span class="ind-val" style="font-size:0.75rem;">${item.reason}</span></div>` : ''}
                 </div>
             </div>
         `;
@@ -408,6 +420,56 @@ async function fetchLogs() {
         logBox.scrollTop = logBox.scrollHeight;
     } catch (e) {
         console.error("Error fetching logs:", e);
+    }
+}
+
+async function fetchTrades() {
+    const tbody = document.getElementById("trades-tbody");
+    if (!tbody) return;
+    try {
+        const market = currentTab === 'india' ? 'INDIA' : 'US';
+        const res = await fetch(`/api/trades?market=${market}&limit=20`);
+        if (!res.ok) return;
+        const trades = await res.json();
+        if (!trades.length) {
+            tbody.innerHTML = `<tr><td colspan="6" class="empty-state">No journaled trades yet.</td></tr>`;
+            return;
+        }
+        tbody.innerHTML = trades.map(t => {
+            const pnl = t.pnl != null ? Number(t.pnl) : null;
+            const plClass = pnl == null ? '' : (pnl >= 0 ? 'pl-positive' : 'pl-negative');
+            return `<tr>
+                <td>${t.symbol}</td>
+                <td>${t.side || t.status || '—'}</td>
+                <td>${t.qty ?? '—'}</td>
+                <td>${t.entry_price != null ? t.entry_price : '—'}</td>
+                <td class="${plClass}">${pnl != null ? (pnl >= 0 ? '+' : '') + pnl.toFixed(2) : '—'}</td>
+                <td>${(t.closed_at || t.opened_at || '').toString().slice(0, 19)}</td>
+            </tr>`;
+        }).join('');
+    } catch (e) {
+        console.error("Error fetching trades:", e);
+    }
+}
+
+async function fetchHealth() {
+    const el = document.getElementById("health-text");
+    if (!el) return;
+    try {
+        const res = await fetch('/api/health');
+        if (!res.ok) return;
+        const h = await res.json();
+        const usAge = h.us_cycle_age_sec != null ? `${Math.round(h.us_cycle_age_sec)}s` : '—';
+        const inAge = h.india_cycle_age_sec != null ? `${Math.round(h.india_cycle_age_sec)}s` : '—';
+        el.textContent = `US cycle ${usAge} | IN cycle ${inAge} | 429s ${h.alpaca_429_count || 0}`;
+        if (h.us_last_error || h.india_last_error) {
+            el.textContent += ' | err';
+            el.style.color = 'var(--warning)';
+        } else {
+            el.style.color = '';
+        }
+    } catch (e) {
+        /* ignore */
     }
 }
 

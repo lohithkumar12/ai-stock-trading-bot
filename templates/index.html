@@ -40,6 +40,9 @@
                 <div class="badge status-badge" id="kill-switch-badge">
                     <i class="fa-solid fa-circle-check"></i> <span id="system-status">System Normal</span>
                 </div>
+                <div class="badge mode-badge" id="health-badge">
+                    <i class="fa-solid fa-heart-pulse"></i> <span id="health-text">Health…</span>
+                </div>
             </div>
 
             <div class="nav-actions">
@@ -122,6 +125,29 @@
                             <tr>
                                 <td colspan="9" class="empty-state">No open positions currently held.</td>
                             </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </section>
+
+            <section class="panel">
+                <div class="panel-header">
+                    <h3><i class="fa-solid fa-book"></i> Recent Trades</h3>
+                </div>
+                <div class="table-responsive">
+                    <table class="data-table">
+                        <thead>
+                            <tr>
+                                <th>Symbol</th>
+                                <th>Side/Status</th>
+                                <th>Qty</th>
+                                <th>Entry</th>
+                                <th>PnL</th>
+                                <th>Time</th>
+                            </tr>
+                        </thead>
+                        <tbody id="trades-tbody">
+                            <tr><td colspan="6" class="empty-state">Loading trades…</td></tr>
                         </tbody>
                     </table>
                 </div>
