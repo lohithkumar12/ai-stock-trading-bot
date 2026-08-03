@@ -595,14 +595,14 @@ def toggle_kill_switch():
 
 def run_dashboard_server(host="0.0.0.0", port=None):
     if port is None:
-        port = int(os.environ.get("PORT", 5000))
+        port = int(os.environ.get("PORT", 8080))
     logger.info(f"Admin Dashboard running on port {port}")
     app.run(host=host, port=port, debug=False, use_reloader=False)
 
 
 def start_dashboard_in_background(port=None):
     if port is None:
-        port = int(os.environ.get("PORT", 5000))
+        port = int(os.environ.get("PORT", 8080))
     t = threading.Thread(target=run_dashboard_server, kwargs={"port": port}, daemon=True)
     t.start()
     return t

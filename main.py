@@ -11,6 +11,7 @@ Process stays alive around the clock; trades only during market hours.
 """
 
 import logging
+import os
 import sys
 import time
 import threading
@@ -33,6 +34,8 @@ except ImportError:
 
 
 def setup_logging():
+    from pathlib import Path
+
     log_format = "%(asctime)s | %(levelname)-8s | %(name)-18s | %(message)s"
     date_format = "%Y-%m-%d %H:%M:%S"
 
@@ -44,7 +47,9 @@ def setup_logging():
     console_handler.setFormatter(logging.Formatter(log_format, date_format))
     root_logger.addHandler(console_handler)
 
-    file_handler = logging.FileHandler("trading_bot.log", mode="a", encoding="utf-8")
+    log_dir = Path("logs")
+    log_dir.mkdir(parents=True, exist_ok=True)
+    file_handler = logging.FileHandler(log_dir / "trading_bot.log", mode="a", encoding="utf-8")
     file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(logging.Formatter(log_format, date_format))
     root_logger.addHandler(file_handler)
@@ -505,8 +510,9 @@ def run_bot():
     trade_journal.init_db()
 
     try:
-        start_dashboard_in_background(port=5000)
-        logger.info("[DASHBOARD] http://localhost:5000  (US / India / Combined tabs)")
+        dash_port = int(os.environ.get("PORT", 5000))
+        start_dashboard_in_background(port=dash_port)
+        logger.info(f"[DASHBOARD] http://0.0.0.0:{dash_port}  (US / India / Combined tabs)")
     except Exception as e:
         logger.warning(f"Dashboard failed to start: {e}")
 

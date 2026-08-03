@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# GCP Ubuntu VM setup for the AI stock trading bot.
+# GCP VM setup — Docker on port 80 (same pattern as AI UseCase).
 # Run from the repo root AFTER: git clone ... && cd ai-stock-trading-bot
 # Usage: bash scripts/vm_setup.sh
 
@@ -8,76 +8,54 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
-SERVICE_NAME="trading-bot"
-SERVICE_USER="$(whoami)"
-VENV_DIR="$REPO_ROOT/venv"
-PYTHON_BIN="$VENV_DIR/bin/python"
-SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
-
-echo "==> Installing system packages"
-sudo apt-get update -y
-sudo apt-get install -y python3 python3-pip python3-venv git
-
-echo "==> Creating virtualenv"
-if [[ ! -d "$VENV_DIR" ]]; then
-  python3 -m venv "$VENV_DIR"
+echo "==> Installing Docker (if needed)"
+if ! command -v docker >/dev/null 2>&1; then
+  sudo apt-get update -y
+  sudo apt-get install -y ca-certificates curl
+  sudo install -m 0755 -d /etc/apt/keyrings
+  sudo curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc
+  sudo chmod a+r /etc/apt/keyrings/docker.asc
+  echo \
+    "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian \
+    $(. /etc/os-release && echo \"$VERSION_CODENAME\") stable" | \
+    sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+  sudo apt-get update -y
+  sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+  sudo usermod -aG docker "$(whoami)" || true
 fi
-# shellcheck disable=SC1091
-source "$VENV_DIR/bin/activate"
-pip install --upgrade pip
-pip install -r requirements.txt
 
 if [[ ! -f "$REPO_ROOT/.env" ]]; then
   echo ""
   echo "WARNING: .env is missing."
-  echo "Copy your local .env onto this VM before starting the bot:"
-  echo "  nano $REPO_ROOT/.env"
-  echo "  chmod 600 $REPO_ROOT/.env"
-  echo ""
   if [[ -f "$REPO_ROOT/.env.example" ]]; then
     cp "$REPO_ROOT/.env.example" "$REPO_ROOT/.env"
     chmod 600 "$REPO_ROOT/.env"
-    echo "Created .env from .env.example — replace placeholder keys before going live."
+    echo "Created .env from .env.example — edit keys before relying on live APIs:"
+    echo "  nano $REPO_ROOT/.env"
   fi
 else
   chmod 600 "$REPO_ROOT/.env"
-  echo "==> Found existing .env (permissions set to 600)"
+  echo "==> Found existing .env"
 fi
 
-echo "==> Writing systemd unit: $SERVICE_FILE"
-sudo tee "$SERVICE_FILE" >/dev/null <<EOF
-[Unit]
-Description=AI Stock Trading Bot (US + India)
-After=network-online.target
-Wants=network-online.target
+echo "==> Stopping old systemd service if present"
+if systemctl list-unit-files | grep -q '^trading-bot.service'; then
+  sudo systemctl disable --now trading-bot 2>/dev/null || true
+fi
 
-[Service]
-Type=simple
-User=${SERVICE_USER}
-WorkingDirectory=${REPO_ROOT}
-Environment=PATH=${VENV_DIR}/bin:/usr/local/bin:/usr/bin
-ExecStart=${PYTHON_BIN} ${REPO_ROOT}/main.py
-Restart=always
-RestartSec=10
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-echo "==> Enabling and starting ${SERVICE_NAME}"
-sudo systemctl daemon-reload
-sudo systemctl enable --now "$SERVICE_NAME"
+echo "==> Building and starting container (host :80 → container :8080)"
+if docker info >/dev/null 2>&1; then
+  docker compose up -d --build
+else
+  sudo docker compose up -d --build
+fi
 
 echo ""
-echo "Done."
-echo "  Status:  sudo systemctl status ${SERVICE_NAME}"
-echo "  Logs:    journalctl -u ${SERVICE_NAME} -f"
-echo "  Restart: sudo systemctl restart ${SERVICE_NAME}"
-echo "  Update:  git pull && source venv/bin/activate && pip install -r requirements.txt && sudo systemctl restart ${SERVICE_NAME}"
+echo "Done. Same access pattern as AI UseCase:"
+echo "  Open:  http://YOUR_EXTERNAL_IP"
+echo "  Logs:  docker compose logs -f bot"
+echo "  Stop:  docker compose down"
+echo "  Update: git pull && docker compose up -d --build"
 echo ""
-echo "Dashboard has no login. Do NOT open port 5000 publicly."
-echo "From your PC (with gcloud CLI):"
-echo "  gcloud compute ssh trading-bot --zone=asia-south1-a -- -L 5000:localhost:5000"
-echo "Then open http://localhost:5000"
+echo "GCP: keep 'Allow HTTP traffic' ON (port 80)."
+echo "If docker permission denied, log out/in SSH once, or use sudo docker ..."

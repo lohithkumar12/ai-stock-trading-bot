@@ -1,0 +1,48 @@
+# ============================================================
+# AI Stock Trading Bot — Docker Compose
+# Usage (on GCP VM — same as AI UseCase):
+#   docker compose up -d --build
+#   docker compose logs -f bot
+#   docker compose down
+# Dashboard: http://EXTERNAL_IP  (port 80 → container 8080)
+# ============================================================
+
+services:
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ai_stock_trading_bot
+    restart: unless-stopped
+    user: "root"
+    ports:
+      - "80:8080"
+    env_file:
+      - .env
+    environment:
+      PORT: "8080"
+      TRADE_JOURNAL_PATH: /app/data/trade_journal.db
+      INDIA_PAPER_PORTFOLIO_PATH: /app/data/india_paper_portfolio.json
+    volumes:
+      - bot_data:/app/data
+      - bot_logs:/app/logs
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: "1.0"
+        reservations:
+          memory: 256M
+          cpus: "0.25"
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+volumes:
+  bot_data:
+    driver: local
+  bot_logs:
+    driver: local

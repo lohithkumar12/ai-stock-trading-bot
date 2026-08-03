@@ -16,6 +16,10 @@ __pycache__/
 
 # Log files
 *.log
+logs/
+
+# Docker local data (named volumes are preferred on VM)
+data/
 
 # Virtual environments
 venv/

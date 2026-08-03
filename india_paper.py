@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 import uuid
 from datetime import datetime, timezone
@@ -18,7 +19,10 @@ import config
 
 logger = logging.getLogger(__name__)
 
-PORTFOLIO_PATH = Path(__file__).resolve().parent / "india_paper_portfolio.json"
+_default_portfolio = Path(__file__).resolve().parent / "india_paper_portfolio.json"
+PORTFOLIO_PATH = Path(
+    os.getenv("INDIA_PAPER_PORTFOLIO_PATH", str(_default_portfolio))
+).expanduser().resolve()
 _lock = threading.Lock()
 
 
@@ -65,6 +69,7 @@ class IndiaPaperPortfolio:
             "start_of_day_equity": self.start_of_day_equity,
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
+        PORTFOLIO_PATH.parent.mkdir(parents=True, exist_ok=True)
         PORTFOLIO_PATH.write_text(
             json.dumps(payload, indent=2), encoding="utf-8"
         )
