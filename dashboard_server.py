@@ -21,9 +21,10 @@ from flask_cors import CORS
 
 import config
 from data_feed import DataFeed
-from strategy import Strategy
+from strategy import Strategy, create_strategy
 from risk_manager import RiskManager
 from execution import TradeExecutor
+import trade_journal
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +41,7 @@ _equity_history = []
 # India components
 _india_broker = None
 _india_strategy = None
+_india_risk_mgr = None
 _india_equity_history = []
 
 
@@ -48,17 +50,17 @@ def get_components():
     global _executor, _data_feed, _strategy, _risk_mgr
     if config.IS_PLACEHOLDER_KEY:
         if _risk_mgr is None:
-            _risk_mgr = RiskManager()
+            _risk_mgr = RiskManager(market="US")
         if _strategy is None:
-            _strategy = Strategy()
+            _strategy = create_strategy("US")
         return None, None, _strategy, _risk_mgr
 
     if _executor is None:
         try:
             _executor = TradeExecutor()
             _data_feed = DataFeed()
-            _strategy = Strategy()
-            _risk_mgr = RiskManager()
+            _strategy = create_strategy("US")
+            _risk_mgr = RiskManager(market="US")
         except Exception as e:
             logger.error(f"Error initializing US dashboard components: {e}")
     return _executor, _data_feed, _strategy, _risk_mgr
@@ -66,7 +68,7 @@ def get_components():
 
 def get_india_components():
     """Initialize India market components (Angel One)."""
-    global _india_broker, _india_strategy
+    global _india_broker, _india_strategy, _india_risk_mgr
     if not config.INDIA_ENABLED:
         return None, None
 
@@ -74,10 +76,18 @@ def get_india_components():
         try:
             from india_broker import IndiaBroker
             _india_broker = IndiaBroker()
-            _india_strategy = Strategy()  # Same strategy engine
+            _india_strategy = create_strategy("INDIA")
+            _india_risk_mgr = RiskManager(market="INDIA")
         except Exception as e:
             logger.error(f"Error initializing India dashboard components: {e}")
     return _india_broker, _india_strategy
+
+
+def get_india_risk():
+    global _india_risk_mgr
+    if _india_risk_mgr is None:
+        _india_risk_mgr = RiskManager(market="INDIA")
+    return _india_risk_mgr
 
 
 # ===========================================================================
@@ -124,6 +134,7 @@ def get_status():
         "currency": "USD",
         "paper_trading": config.PAPER_TRADING,
         "live_armed": config.LIVE_CONFIRMED,
+        "strategy": config.STRATEGY_NAME,
         "equity": current_equity,
         "last_equity": last_equity,
         "buying_power": account_info["buying_power"],
@@ -135,6 +146,12 @@ def get_status():
         "india_enabled": config.INDIA_ENABLED,
         "india_paper": config.INDIA_PAPER,
         "equity_history": _equity_history,
+        "performance": trade_journal.performance_stats("US"),
+        "open_risk_pct": round(
+            risk_mgr.open_risk_pct(current_equity, executor.get_open_positions() if executor else {})
+            if risk_mgr else 0.0,
+            4,
+        ),
     })
 
 
@@ -173,8 +190,17 @@ def get_positions():
 
     for symbol, pos in positions_dict.items():
         entry_price = pos["avg_entry_price"]
-        sl_price = risk_mgr.get_stop_loss_price(entry_price) if risk_mgr else round(entry_price * 0.98, 2)
-        tp_price = risk_mgr.get_take_profit_price(entry_price) if risk_mgr else round(entry_price * 1.04, 2)
+        atr = None
+        sl_price = pos.get("stop_loss")
+        tp_price = pos.get("take_profit")
+        if sl_price is None:
+            sl_price = risk_mgr.get_stop_loss_price(entry_price, atr) if risk_mgr else round(entry_price * 0.98, 2)
+        if tp_price is None:
+            tp_price = (
+                risk_mgr.get_take_profit_price(entry_price, stop_loss_price=sl_price, atr=atr)
+                if risk_mgr
+                else round(entry_price * 1.04, 2)
+            )
 
         positions_list.append({
             "symbol": symbol,
@@ -198,6 +224,10 @@ def get_scanner():
         return jsonify([])
 
     scanner_results = []
+    sma_slow = getattr(strategy.p, "sma_slow", config.SMA_SLOW) if hasattr(strategy, "p") else config.SMA_SLOW
+    sma_fast = getattr(strategy.p, "sma_fast", config.SMA_FAST) if hasattr(strategy, "p") else config.SMA_FAST
+    rsi_period = getattr(strategy.p, "rsi_period", config.RSI_PERIOD) if hasattr(strategy, "p") else config.RSI_PERIOD
+
     for symbol in config.STOCK_UNIVERSE:
         try:
             df = data_feed.get_historical_bars(symbol)
@@ -209,11 +239,13 @@ def get_scanner():
                 scanner_results.append({
                     "symbol": symbol,
                     "price": round(float(latest["close"]), 2),
-                    "sma_200": round(float(latest[f"SMA_{config.SMA_SLOW}"]), 2) if not pd_isna(latest.get(f"SMA_{config.SMA_SLOW}")) else None,
-                    "sma_20": round(float(latest[f"SMA_{config.SMA_FAST}"]), 2) if not pd_isna(latest.get(f"SMA_{config.SMA_FAST}")) else None,
-                    "rsi": round(float(latest[f"RSI_{config.RSI_PERIOD}"]), 1) if not pd_isna(latest.get(f"RSI_{config.RSI_PERIOD}")) else None,
+                    "sma_200": round(float(latest[f"SMA_{sma_slow}"]), 2) if not pd_isna(latest.get(f"SMA_{sma_slow}")) else None,
+                    "sma_20": round(float(latest[f"SMA_{sma_fast}"]), 2) if not pd_isna(latest.get(f"SMA_{sma_fast}")) else None,
+                    "rsi": round(float(latest[f"RSI_{rsi_period}"]), 1) if not pd_isna(latest.get(f"RSI_{rsi_period}")) else None,
                     "bbl": round(float(latest["BBL"]), 2) if not pd_isna(latest.get("BBL")) else None,
                     "bbu": round(float(latest["BBU"]), 2) if not pd_isna(latest.get("BBU")) else None,
+                    "atr": round(float(latest["ATR"]), 2) if not pd_isna(latest.get("ATR")) else None,
+                    "adx": round(float(latest["ADX"]), 1) if not pd_isna(latest.get("ADX")) else None,
                     "signal": signal
                 })
             else:
@@ -293,7 +325,13 @@ def get_india_status():
         "logged_in": india_broker.is_logged_in,
         "paper_trading": config.INDIA_PAPER,
         "live_armed": config.LIVE_CONFIRMED,
-        "equity_history": _india_equity_history
+        "strategy": config.STRATEGY_NAME,
+        "equity_history": _india_equity_history,
+        "performance": trade_journal.performance_stats("INDIA"),
+        "open_risk_pct": round(
+            get_india_risk().open_risk_pct(equity, india_broker.get_open_positions()),
+            4,
+        ),
     })
 
 
@@ -309,12 +347,19 @@ def get_india_positions():
     positions_dict = india_broker.get_open_positions()
     positions_list = []
 
-    _, _, _, risk_mgr = get_components()
+    risk_mgr = get_india_risk()
 
     for symbol, pos in positions_dict.items():
         entry_price = pos["avg_entry_price"]
-        sl_price = risk_mgr.get_stop_loss_price(entry_price) if risk_mgr else round(entry_price * 0.98, 2)
-        tp_price = risk_mgr.get_take_profit_price(entry_price) if risk_mgr else round(entry_price * 1.04, 2)
+        atr = pos.get("atr")
+        sl_price = pos.get("stop_loss")
+        tp_price = pos.get("take_profit")
+        if sl_price is None:
+            sl_price = risk_mgr.get_stop_loss_price(entry_price, atr)
+        if tp_price is None:
+            tp_price = risk_mgr.get_take_profit_price(
+                entry_price, stop_loss_price=sl_price, atr=atr
+            )
 
         positions_list.append({
             "symbol": symbol,
@@ -340,6 +385,10 @@ def get_india_scanner():
     if not india_broker or not india_broker.is_logged_in or not strategy:
         return jsonify([])
 
+    sma_slow = getattr(strategy.p, "sma_slow", config.INDIA_SMA_SLOW) if hasattr(strategy, "p") else config.INDIA_SMA_SLOW
+    sma_fast = getattr(strategy.p, "sma_fast", config.INDIA_SMA_FAST) if hasattr(strategy, "p") else config.INDIA_SMA_FAST
+    rsi_period = getattr(strategy.p, "rsi_period", config.INDIA_RSI_PERIOD) if hasattr(strategy, "p") else config.INDIA_RSI_PERIOD
+
     scanner_results = []
     for symbol in config.INDIA_STOCK_UNIVERSE:
         try:
@@ -352,11 +401,13 @@ def get_india_scanner():
                 scanner_results.append({
                     "symbol": symbol,
                     "price": round(float(latest["close"]), 2),
-                    "sma_200": round(float(latest[f"SMA_{config.SMA_SLOW}"]), 2) if not pd_isna(latest.get(f"SMA_{config.SMA_SLOW}")) else None,
-                    "sma_20": round(float(latest[f"SMA_{config.SMA_FAST}"]), 2) if not pd_isna(latest.get(f"SMA_{config.SMA_FAST}")) else None,
-                    "rsi": round(float(latest[f"RSI_{config.RSI_PERIOD}"]), 1) if not pd_isna(latest.get(f"RSI_{config.RSI_PERIOD}")) else None,
+                    "sma_200": round(float(latest[f"SMA_{sma_slow}"]), 2) if not pd_isna(latest.get(f"SMA_{sma_slow}")) else None,
+                    "sma_20": round(float(latest[f"SMA_{sma_fast}"]), 2) if not pd_isna(latest.get(f"SMA_{sma_fast}")) else None,
+                    "rsi": round(float(latest[f"RSI_{rsi_period}"]), 1) if not pd_isna(latest.get(f"RSI_{rsi_period}")) else None,
                     "bbl": round(float(latest["BBL"]), 2) if not pd_isna(latest.get("BBL")) else None,
                     "bbu": round(float(latest["BBU"]), 2) if not pd_isna(latest.get("BBU")) else None,
+                    "atr": round(float(latest["ATR"]), 2) if not pd_isna(latest.get("ATR")) else None,
+                    "adx": round(float(latest["ADX"]), 1) if not pd_isna(latest.get("ADX")) else None,
                     "signal": signal
                 })
             else:
@@ -448,6 +499,50 @@ def get_combined_status():
     # Chart uses US equity history when available; else India
     result["equity_history"] = _equity_history or _india_equity_history
     return jsonify(result)
+
+
+@app.route("/api/performance")
+def get_performance():
+    """Trade journal performance metrics (win rate, PF, max DD, open risk)."""
+    market = request.args.get("market")
+    if market:
+        market = market.upper()
+    stats = trade_journal.performance_stats(market)
+    curve = trade_journal.equity_curve(market, limit=200)
+    trades = trade_journal.recent_trades(limit=30, market=market)
+
+    open_risk = 0.0
+    if market == "US" or market is None:
+        executor, _, _, risk_mgr = get_components()
+        if executor and risk_mgr:
+            acct = executor.get_account_info()
+            if acct:
+                open_risk = risk_mgr.open_risk_pct(acct["equity"], executor.get_open_positions())
+    if market == "INDIA":
+        india_broker, _ = get_india_components()
+        if india_broker and india_broker.is_logged_in:
+            acct = india_broker.get_account_info()
+            if acct:
+                open_risk = get_india_risk().open_risk_pct(
+                    acct["equity"], india_broker.get_open_positions()
+                )
+
+    return jsonify({
+        "status": "success",
+        "market": market or "ALL",
+        "strategy": config.STRATEGY_NAME,
+        "stats": stats,
+        "equity_curve": curve,
+        "recent_trades": trades,
+        "open_risk_pct": round(open_risk, 4),
+    })
+
+
+@app.route("/api/trades")
+def get_trades():
+    market = request.args.get("market")
+    limit = int(request.args.get("limit", "50"))
+    return jsonify(trade_journal.recent_trades(limit=limit, market=market))
 
 
 def pd_isna(val):

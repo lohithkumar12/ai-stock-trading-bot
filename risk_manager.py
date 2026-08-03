@@ -1,18 +1,23 @@
 """
 risk_manager.py — Risk Management Module
 ==========================================
-Enforces strict capital preservation rules to protect the portfolio:
+Capital preservation rules:
 
-  1. Position Sizing  — Max 5% of equity per single stock position.
-  2. Hard Stop-Loss   — Automatic exit at 2% below entry price.
-  3. Take-Profit      — Automatic exit at 4% above entry price.
-  4. Drawdown Kill-Switch — Pause ALL trading if daily loss exceeds 3%.
-  5. Duplicate Prevention — Only one position per symbol at a time.
-
-All thresholds are configurable via config.py.
+  1. Risk-per-trade sizing — shares from (equity × RISK_PER_TRADE) / stop_distance
+  2. ATR-based stop-loss   — default 2.0× ATR (fallback: STOP_LOSS_PCT)
+  3. Take-profit           — TAKE_PROFIT_R × risk (R-multiple) + trailing ATR
+  4. Max open positions    — book-wide cap
+  5. Correlation cluster   — cap same-theme pile-ons
+  6. Daily drawdown kill-switch — reset only on new trading day
+  7. Session window        — skip first/last N minutes unless configured
+  8. Duplicate prevention  — one position per symbol
 """
 
+from __future__ import annotations
+
 import logging
+from datetime import datetime
+from typing import Optional
 
 import config
 
@@ -20,113 +25,261 @@ logger = logging.getLogger(__name__)
 
 
 class RiskManager:
-    """
-    Strict risk controls to protect capital.
-
-    This module is the "safety net" of the bot. Even if the strategy
-    generates a signal, the RiskManager can block the trade if it
-    violates any risk rule.
-    """
-
-    def __init__(self):
-        """Initialize risk parameters from config."""
+    def __init__(self, market: str = "US"):
+        self.market = market.upper()
+        self.risk_per_trade = config.RISK_PER_TRADE
         self.max_position_pct = config.MAX_POSITION_PCT
+        self.atr_stop_mult = config.ATR_STOP_MULT
+        self.atr_trail_mult = config.ATR_TRAIL_MULT
+        self.take_profit_r = config.TAKE_PROFIT_R
         self.stop_loss_pct = config.STOP_LOSS_PCT
         self.take_profit_pct = config.TAKE_PROFIT_PCT
         self.daily_drawdown_limit = config.DAILY_DRAWDOWN_LIMIT
+        self.max_open_positions = config.MAX_OPEN_POSITIONS
+        self.max_cluster_positions = config.MAX_CLUSTER_POSITIONS
 
-        # Internal flag — set to True when daily drawdown limit is breached
         self._kill_switch_active: bool = False
+        self._kill_switch_day = None  # date when kill switch tripped
+
+        # Track high-water marks for trailing stops: symbol -> peak price since entry
+        self._trail_peaks: dict[str, float] = {}
+        # Track entry + initial stop for R calc: symbol -> {entry, stop, atr}
+        self._trade_meta: dict[str, dict] = {}
+
+        clusters = (
+            config.INDIA_CORRELATION_CLUSTERS
+            if self.market == "INDIA"
+            else config.US_CORRELATION_CLUSTERS
+        )
+        self._clusters = clusters
 
         logger.info(
-            f"RiskManager initialized — "
-            f"MaxPos={self.max_position_pct:.0%}, "
-            f"SL={self.stop_loss_pct:.0%}, "
-            f"TP={self.take_profit_pct:.0%}, "
+            f"RiskManager[{self.market}] — "
+            f"Risk/trade={self.risk_per_trade:.2%}, "
+            f"MaxPos%={self.max_position_pct:.0%}, "
+            f"ATR_SL={self.atr_stop_mult}x, "
+            f"TP={self.take_profit_r}R, "
+            f"MaxOpen={self.max_open_positions}, "
+            f"ClusterCap={self.max_cluster_positions}, "
             f"DailyDD={self.daily_drawdown_limit:.0%}"
         )
 
     # -----------------------------------------------------------------------
-    # Position Sizing
+    # Position Sizing (risk-to-stop)
     # -----------------------------------------------------------------------
-    def calculate_position_size(self, equity: float, price: float) -> int:
+    def calculate_position_size(
+        self,
+        equity: float,
+        price: float,
+        stop_distance: float | None = None,
+    ) -> int:
         """
-        Calculate the maximum number of shares to buy for a single position.
-
-        Formula: shares = floor((equity × MAX_POSITION_PCT) / price)
-        Example: $100,000 equity × 5% = $5,000 budget → $5,000 / $150 = 33 shares
-
-        Args:
-            equity: Current total portfolio equity in dollars.
-            price:  Current share price (ask price for buys).
-
-        Returns:
-            Integer number of shares (floored). Returns 0 if price is invalid.
+        Size by risk-per-trade when stop_distance is known:
+          shares = floor((equity × RISK_PER_TRADE) / stop_distance)
+        Also capped by MAX_POSITION_PCT of equity and MAX_SHARES_PER_ORDER.
         """
-        if price <= 0:
-            logger.warning("Invalid price for position sizing — returning 0 shares.")
+        if price <= 0 or equity <= 0:
+            logger.warning("Invalid equity/price for sizing — 0 shares.")
             return 0
 
-        max_dollar_amount = equity * self.max_position_pct
-        shares = int(max_dollar_amount // price)
+        # Risk-based shares
+        if stop_distance is not None and stop_distance > 0:
+            risk_budget = equity * self.risk_per_trade
+            shares_risk = int(risk_budget // stop_distance)
+        else:
+            # Fallback: % of equity (legacy)
+            shares_risk = int((equity * self.max_position_pct) // price)
 
-        # Live-capital hard cap
+        # Hard dollar cap
+        max_by_pct = int((equity * self.max_position_pct) // price)
+        shares = min(shares_risk, max_by_pct) if max_by_pct > 0 else 0
+
         max_shares = getattr(config, "MAX_SHARES_PER_ORDER", 50)
         if shares > max_shares:
             logger.warning(
-                f"Position size capped: {shares} → {max_shares} shares "
-                f"(MAX_SHARES_PER_ORDER)"
+                f"Position size capped: {shares} → {max_shares} (MAX_SHARES_PER_ORDER)"
             )
             shares = max_shares
 
         logger.info(
-            f"Position sizing: "
-            f"Equity={equity:,.2f} × {self.max_position_pct:.0%} "
-            f"= {max_dollar_amount:,.2f} budget → "
-            f"{shares} shares @ {price:.2f}/share"
+            f"Sizing: equity={equity:,.2f} risk={self.risk_per_trade:.2%} "
+            f"stop_dist={stop_distance if stop_distance else 'n/a'} "
+            f"→ {shares} shares @ {price:.2f}"
         )
         return shares
 
     # -----------------------------------------------------------------------
-    # Stop-Loss & Take-Profit Price Levels
+    # ATR Stop / Take-Profit / Trailing
     # -----------------------------------------------------------------------
-    def get_stop_loss_price(self, entry_price: float) -> float:
+    def get_stop_loss_price(
+        self,
+        entry_price: float,
+        atr: float | None = None,
+    ) -> float:
+        if atr is not None and atr > 0:
+            sl = round(entry_price - (self.atr_stop_mult * atr), 2)
+        else:
+            sl = round(entry_price * (1 - self.stop_loss_pct), 2)
+        # Never above entry for longs
+        if sl >= entry_price:
+            sl = round(entry_price * (1 - self.stop_loss_pct), 2)
+        return max(sl, 0.01)
+
+    def get_take_profit_price(
+        self,
+        entry_price: float,
+        stop_loss_price: float | None = None,
+        atr: float | None = None,
+    ) -> float:
+        """R-multiple target from stop distance; fallback to TAKE_PROFIT_PCT."""
+        if stop_loss_price is not None and stop_loss_price < entry_price:
+            risk = entry_price - stop_loss_price
+            tp = round(entry_price + (self.take_profit_r * risk), 2)
+        elif atr is not None and atr > 0:
+            risk = self.atr_stop_mult * atr
+            tp = round(entry_price + (self.take_profit_r * risk), 2)
+        else:
+            tp = round(entry_price * (1 + self.take_profit_pct), 2)
+        return tp
+
+    def register_trade(
+        self,
+        symbol: str,
+        entry_price: float,
+        stop_loss_price: float,
+        atr: float | None = None,
+    ):
+        self._trade_meta[symbol] = {
+            "entry": entry_price,
+            "stop": stop_loss_price,
+            "atr": atr,
+            "initial_stop": stop_loss_price,
+        }
+        self._trail_peaks[symbol] = entry_price
+
+    def clear_trade(self, symbol: str):
+        self._trade_meta.pop(symbol, None)
+        self._trail_peaks.pop(symbol, None)
+
+    def update_trailing_stop(
+        self,
+        symbol: str,
+        current_price: float,
+        atr: float | None = None,
+    ) -> Optional[float]:
         """
-        Calculate the hard stop-loss price.
-
-        Example: Entry at $150.00, SL=2% → Stop at $147.00
-
-        Args:
-            entry_price: The limit price at which the position is entered.
-
-        Returns:
-            Stop-loss price rounded to 2 decimal places.
+        After price moves in favor, trail stop at peak − ATR_TRAIL_MULT × ATR.
+        Returns the effective stop (max of initial SL and trail), or None if unknown.
         """
-        sl_price = round(entry_price * (1 - self.stop_loss_pct), 2)
-        logger.debug(
-            f"Stop-loss: ${entry_price:.2f} × "
-            f"(1 − {self.stop_loss_pct:.0%}) = ${sl_price:.2f}"
-        )
-        return sl_price
+        meta = self._trade_meta.get(symbol)
+        if not meta:
+            return None
 
-    def get_take_profit_price(self, entry_price: float) -> float:
+        peak = max(self._trail_peaks.get(symbol, meta["entry"]), current_price)
+        self._trail_peaks[symbol] = peak
+
+        use_atr = atr if (atr and atr > 0) else meta.get("atr")
+        initial_stop = meta["initial_stop"]
+
+        # Only start trailing once we've moved at least 1R in favor
+        risk = meta["entry"] - initial_stop
+        if risk <= 0 or (peak - meta["entry"]) < risk:
+            return initial_stop
+
+        if use_atr and use_atr > 0:
+            trail = round(peak - (self.atr_trail_mult * use_atr), 2)
+        else:
+            trail = round(peak * (1 - self.stop_loss_pct), 2)
+
+        effective = max(initial_stop, trail)
+        meta["stop"] = effective
+        return effective
+
+    def get_effective_stop(self, symbol: str, entry_price: float, atr: float | None = None) -> float:
+        meta = self._trade_meta.get(symbol)
+        if meta:
+            return float(meta.get("stop") or meta["initial_stop"])
+        return self.get_stop_loss_price(entry_price, atr)
+
+    # -----------------------------------------------------------------------
+    # Session window (avoid open/close noise)
+    # -----------------------------------------------------------------------
+    def is_tradable_session(
+        self,
+        now: datetime | None = None,
+        market_open_hm: tuple[int, int] = (9, 30),
+        market_close_hm: tuple[int, int] = (16, 0),
+    ) -> bool:
         """
-        Calculate the take-profit price.
-
-        Example: Entry at $150.00, TP=4% → Target at $156.00
-
-        Args:
-            entry_price: The limit price at which the position is entered.
-
-        Returns:
-            Take-profit price rounded to 2 decimal places.
+        Returns False during first/last AVOID_* minutes unless ALLOW_OPEN_CLOSE_WINDOW.
+        `now` should already be in the market's local timezone.
         """
-        tp_price = round(entry_price * (1 + self.take_profit_pct), 2)
-        logger.debug(
-            f"Take-profit: ${entry_price:.2f} × "
-            f"(1 + {self.take_profit_pct:.0%}) = ${tp_price:.2f}"
-        )
-        return tp_price
+        if config.ALLOW_OPEN_CLOSE_WINDOW:
+            return True
+
+        if now is None:
+            now = datetime.now()
+
+        open_mins = market_open_hm[0] * 60 + market_open_hm[1]
+        close_mins = market_close_hm[0] * 60 + market_close_hm[1]
+        cur = now.hour * 60 + now.minute
+
+        if cur < open_mins + config.AVOID_OPEN_MINUTES:
+            logger.info(
+                f"[{self.market}] Skipping — within first "
+                f"{config.AVOID_OPEN_MINUTES}m of session"
+            )
+            return False
+        if cur > close_mins - config.AVOID_CLOSE_MINUTES:
+            logger.info(
+                f"[{self.market}] Skipping — within last "
+                f"{config.AVOID_CLOSE_MINUTES}m of session"
+            )
+            return False
+        return True
+
+    # -----------------------------------------------------------------------
+    # Position / cluster limits
+    # -----------------------------------------------------------------------
+    def _cluster_for(self, symbol: str) -> str | None:
+        for name, members in self._clusters.items():
+            if symbol in members:
+                return name
+        return None
+
+    def is_position_allowed(
+        self,
+        symbol: str,
+        current_positions: dict,
+    ) -> bool:
+        if symbol in current_positions:
+            logger.info(
+                f"{symbol}: Already holding "
+                f"({current_positions[symbol].get('qty', '?')} shares) — skip."
+            )
+            return False
+
+        if len(current_positions) >= self.max_open_positions:
+            logger.info(
+                f"{symbol}: Max open positions ({self.max_open_positions}) reached — skip."
+            )
+            return False
+
+        cluster = self._cluster_for(symbol)
+        if cluster:
+            held_in_cluster = sum(
+                1
+                for s in current_positions
+                if self._cluster_for(s) == cluster
+            )
+            if held_in_cluster >= self.max_cluster_positions:
+                logger.info(
+                    f"{symbol}: Cluster '{cluster}' already has "
+                    f"{held_in_cluster} positions (cap={self.max_cluster_positions}) — skip."
+                )
+                return False
+
+        return True
 
     # -----------------------------------------------------------------------
     # Daily Drawdown Kill-Switch
@@ -134,85 +287,53 @@ class RiskManager:
     def check_daily_drawdown(
         self, current_equity: float, start_of_day_equity: float
     ) -> bool:
-        """
-        Check if daily drawdown exceeds the kill-switch threshold.
-
-        If the portfolio has lost more than DAILY_DRAWDOWN_LIMIT (default 3%)
-        from the start-of-day equity, ALL trading is paused immediately.
-
-        Args:
-            current_equity:       Current portfolio equity.
-            start_of_day_equity:  Portfolio equity at market open (previous close).
-
-        Returns:
-            True if drawdown limit is breached (trading should STOP).
-            False if drawdown is within acceptable range (trading continues).
-        """
         if start_of_day_equity <= 0:
             logger.error(
-                "Start-of-day equity is zero or negative — "
-                "cannot compute drawdown. Halting for safety."
+                "Start-of-day equity invalid — halting for safety."
             )
-            return True  # Fail-safe: stop trading
+            return True
 
         drawdown = (start_of_day_equity - current_equity) / start_of_day_equity
 
         if drawdown >= self.daily_drawdown_limit:
             self._kill_switch_active = True
+            self._kill_switch_day = datetime.now().date()
             logger.critical(
-                f"🚨 DAILY DRAWDOWN KILL-SWITCH TRIGGERED! "
-                f"Drawdown = {drawdown:.2%} (Limit = {self.daily_drawdown_limit:.0%}) | "
-                f"SOD Equity = ${start_of_day_equity:,.2f} → "
-                f"Current = ${current_equity:,.2f} | "
-                f"ALL TRADING PAUSED."
+                f"DAILY DRAWDOWN KILL-SWITCH TRIGGERED! "
+                f"Drawdown={drawdown:.2%} (Limit={self.daily_drawdown_limit:.0%}) | "
+                f"SOD={start_of_day_equity:,.2f} → Current={current_equity:,.2f}"
             )
             return True
 
         logger.info(
-            f"Daily drawdown check: {drawdown:.2%} "
-            f"(Limit = {self.daily_drawdown_limit:.0%}) — ✅ OK"
+            f"Daily drawdown: {drawdown:.2%} "
+            f"(Limit={self.daily_drawdown_limit:.0%}) — OK"
         )
         return False
 
     @property
     def is_kill_switch_active(self) -> bool:
-        """Check if the daily drawdown kill-switch has been triggered."""
         return self._kill_switch_active
 
     def reset_kill_switch(self):
-        """
-        Reset the kill-switch flag.
-
-        Call this at the start of a new trading day so the bot can
-        resume trading after an overnight reset.
-        """
+        """Reset only for a new trading day (caller should gate by date)."""
         self._kill_switch_active = False
-        logger.info("Daily drawdown kill-switch has been reset for new trading day.")
+        self._kill_switch_day = None
+        logger.info(
+            f"[{self.market}] Daily drawdown kill-switch reset for new trading day."
+        )
 
-    # -----------------------------------------------------------------------
-    # Duplicate Position Check
-    # -----------------------------------------------------------------------
-    def is_position_allowed(
-        self, symbol: str, current_positions: dict
-    ) -> bool:
-        """
-        Check if opening a new position for this symbol is allowed.
-
-        Rule: Only one position per symbol at a time. If we already
-        hold shares of a stock, we don't add to the position.
-
-        Args:
-            symbol:             Stock ticker to check (e.g., "AAPL").
-            current_positions:  Dict of {symbol: position_data} for current holdings.
-
-        Returns:
-            True if a new position is allowed, False if already held.
-        """
-        if symbol in current_positions:
-            logger.info(
-                f"{symbol}: Already holding a position "
-                f"({current_positions[symbol].get('qty', '?')} shares) — "
-                f"skipping new entry."
-            )
-            return False
-        return True
+    def open_risk_pct(self, equity: float, positions: dict) -> float:
+        """Approximate open risk as sum of (entry−stop)×qty / equity."""
+        if equity <= 0:
+            return 0.0
+        total_risk = 0.0
+        for symbol, pos in positions.items():
+            entry = float(pos.get("avg_entry_price") or 0)
+            qty = int(pos.get("qty") or 0)
+            if entry <= 0 or qty <= 0:
+                continue
+            stop = self.get_effective_stop(symbol, entry)
+            risk_per_share = max(entry - stop, 0)
+            total_risk += risk_per_share * qty
+        return total_risk / equity

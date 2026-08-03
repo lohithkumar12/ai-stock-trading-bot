@@ -114,13 +114,35 @@ class IndiaPaperPortfolio:
                 "market_value": qty * ltp,
                 "unrealized_pl": pnl,
                 "unrealized_plpc": pnl_pct,
+                "stop_loss": pos.get("stop_loss"),
+                "take_profit": pos.get("take_profit"),
+                "atr": pos.get("atr"),
+                "peak_price": pos.get("peak_price", entry),
                 "trading_symbol": f"{symbol}-EQ",
                 "token": "",
                 "source": "paper",
             }
         return out
 
-    def buy(self, symbol: str, qty: int, price: float) -> str | None:
+    def update_position_meta(self, symbol: str, **fields):
+        """Update SL/TP/peak on an open paper position."""
+        with _lock:
+            if symbol not in self.positions:
+                return
+            for k, v in fields.items():
+                if v is not None:
+                    self.positions[symbol][k] = v
+            self._save()
+
+    def buy(
+        self,
+        symbol: str,
+        qty: int,
+        price: float,
+        stop_loss: float | None = None,
+        take_profit: float | None = None,
+        atr: float | None = None,
+    ) -> str | None:
         if qty <= 0 or price <= 0:
             return None
         cost = qty * price
@@ -140,17 +162,26 @@ class IndiaPaperPortfolio:
                 self.positions[symbol] = {
                     "qty": new_qty,
                     "avg_entry_price": round(new_avg, 4),
+                    "stop_loss": stop_loss if stop_loss is not None else old.get("stop_loss"),
+                    "take_profit": take_profit if take_profit is not None else old.get("take_profit"),
+                    "atr": atr if atr is not None else old.get("atr"),
+                    "peak_price": max(float(old.get("peak_price") or 0), price),
                 }
             else:
                 self.positions[symbol] = {
                     "qty": qty,
                     "avg_entry_price": round(price, 4),
+                    "stop_loss": stop_loss,
+                    "take_profit": take_profit,
+                    "atr": atr,
+                    "peak_price": price,
                 }
 
             order_id = f"PAPER-{uuid.uuid4().hex[:10].upper()}"
             self._save()
             logger.warning(
                 f"[PAPER BUY] {symbol} | Qty={qty} | Price={price:.2f} | "
+                f"SL={stop_loss} TP={take_profit} | "
                 f"Cash left=Rs {self.cash:,.2f} | ID={order_id}"
             )
             return order_id

@@ -17,9 +17,10 @@ import threading
 from datetime import datetime
 
 import config
-from strategy import Strategy
+from strategy import create_strategy, RelativeStrengthFilter
 from risk_manager import RiskManager
 from dashboard_server import start_dashboard_in_background
+import trade_journal
 
 try:
     from zoneinfo import ZoneInfo
@@ -122,28 +123,43 @@ def log_india_portfolio_summary(india_broker, market_label: str = "INDIA"):
     logger.info(f"   Total Unrealized P&L: Rs {total_pl:,.2f}")
 
 
-def run_us_loop(data_feed, strategy, risk_mgr, executor):
+def _refresh_rs_filter(rs_filter, symbol_dfs: dict):
+    if rs_filter is not None and config.USE_RELATIVE_STRENGTH:
+        rs_filter.update_scores(symbol_dfs)
+
+
+def run_us_loop(data_feed, strategy, risk_mgr, executor, rs_filter=None):
     logger.info("[US] US Market trading loop started (24/7 process)")
+    last_reset_date = None
 
     while True:
         try:
             loop_start = time.time()
+            now_et = datetime.now(EASTERN)
+
+            if last_reset_date != now_et.date():
+                risk_mgr.reset_kill_switch()
+                last_reset_date = now_et.date()
+                logger.info(f"[US] New day {now_et.date()} — kill-switch reset")
 
             if not is_us_market_open():
-                now_et = datetime.now(EASTERN)
                 logger.info(
                     f"[US STATUS] Market CLOSED ({now_et.strftime('%A %I:%M %p ET')}). "
                     f"Bot still alive — next check in {config.LOOP_INTERVAL_SEC}s..."
                 )
                 time.sleep(config.LOOP_INTERVAL_SEC)
-                if now_et.hour == 0 and now_et.minute < 6:
-                    risk_mgr.reset_kill_switch()
                 continue
 
             logger.info("-" * 60)
             logger.info(
-                f"[US CYCLE] {datetime.now(EASTERN).strftime('%Y-%m-%d %I:%M:%S %p ET')} "
-                f"| Mode={'PAPER' if config.PAPER_TRADING else 'LIVE'}"
+                f"[US CYCLE] {now_et.strftime('%Y-%m-%d %I:%M:%S %p ET')} "
+                f"| Mode={'PAPER' if config.PAPER_TRADING else 'LIVE'} "
+                f"| Strategy={strategy.name}"
+            )
+
+            # Avoid open/close noise for new entries
+            tradable_window = risk_mgr.is_tradable_session(
+                now_et, market_open_hm=(9, 30), market_close_hm=(16, 0)
             )
 
             account = executor.get_account_info()
@@ -154,6 +170,7 @@ def run_us_loop(data_feed, strategy, risk_mgr, executor):
 
             current_equity = account["equity"]
             sod_equity = account["last_equity"]
+            trade_journal.snapshot_equity("US", current_equity)
 
             if risk_mgr.check_daily_drawdown(current_equity, sod_equity):
                 logger.critical("[US KILL-SWITCH] Trading PAUSED (daily drawdown).")
@@ -161,20 +178,43 @@ def run_us_loop(data_feed, strategy, risk_mgr, executor):
                 time.sleep(config.LOOP_INTERVAL_SEC)
                 continue
 
+            executor.manage_pending_limits()
             current_positions = executor.get_open_positions()
+
+            # Pre-fetch bars for RS ranking + signals
+            bar_cache: dict = {}
+            for symbol in config.STOCK_UNIVERSE:
+                df = data_feed.get_historical_bars(symbol)
+                if df is not None and not df.empty:
+                    bar_cache[symbol] = strategy.compute_indicators(df)
+            _refresh_rs_filter(rs_filter, bar_cache)
 
             for symbol in config.STOCK_UNIVERSE:
                 logger.info(f"[US] -- Scanning {symbol} " + "-" * (40 - len(symbol)))
 
-                df = data_feed.get_historical_bars(symbol)
+                df = bar_cache.get(symbol)
                 if df is None or df.empty:
                     logger.warning(f"[US] {symbol}: No data — skipping.")
                     continue
 
-                df = strategy.compute_indicators(df)
                 signal = strategy.generate_signal(df, symbol)
+                atr = strategy.latest_atr(df)
+
+                # Trailing management for open positions
+                if symbol in current_positions:
+                    pos = current_positions[symbol]
+                    if symbol not in risk_mgr._trade_meta:
+                        sl0 = risk_mgr.get_stop_loss_price(pos["avg_entry_price"], atr)
+                        risk_mgr.register_trade(
+                            symbol, pos["avg_entry_price"], sl0, atr
+                        )
+                    risk_mgr.update_trailing_stop(
+                        symbol, pos["current_price"], atr
+                    )
 
                 if signal == "BUY":
+                    if not tradable_window:
+                        continue
                     if not risk_mgr.is_position_allowed(symbol, current_positions):
                         continue
 
@@ -183,20 +223,56 @@ def run_us_loop(data_feed, strategy, risk_mgr, executor):
                         continue
 
                     limit_price = quote["ask_price"]
-                    qty = risk_mgr.calculate_position_size(current_equity, limit_price)
+                    if limit_price <= 0:
+                        continue
+
+                    sl = risk_mgr.get_stop_loss_price(limit_price, atr)
+                    tp = risk_mgr.get_take_profit_price(
+                        limit_price, stop_loss_price=sl, atr=atr
+                    )
+                    stop_dist = limit_price - sl
+                    qty = risk_mgr.calculate_position_size(
+                        current_equity, limit_price, stop_distance=stop_dist
+                    )
                     if qty <= 0:
                         continue
 
-                    executor.submit_bracket_order(
+                    def _requote():
+                        q = data_feed.get_latest_quote(symbol)
+                        return q["ask_price"] if q else None
+
+                    ok = executor.submit_bracket_order(
                         symbol=symbol,
                         qty=qty,
                         limit_price=limit_price,
-                        stop_loss_price=risk_mgr.get_stop_loss_price(limit_price),
-                        take_profit_price=risk_mgr.get_take_profit_price(limit_price),
+                        stop_loss_price=sl,
+                        take_profit_price=tp,
+                        wait_for_fill=False,
+                        get_requote_price=_requote,
                     )
+                    if ok:
+                        risk_mgr.register_trade(symbol, limit_price, sl, atr)
+                        trade_journal.record_entry(
+                            "US",
+                            symbol,
+                            qty,
+                            limit_price,
+                            stop_price=sl,
+                            take_profit=tp,
+                            reason="signal_buy",
+                            strategy=strategy.name,
+                            meta={"atr": atr},
+                        )
+                        current_positions[symbol] = {"qty": qty}
 
                 elif signal == "SELL" and symbol in current_positions:
-                    executor.close_position(symbol)
+                    pos = current_positions[symbol]
+                    px = pos.get("current_price") or pos.get("avg_entry_price")
+                    if executor.close_position(symbol):
+                        trade_journal.record_exit(
+                            "US", symbol, float(px), reason="signal_sell"
+                        )
+                        risk_mgr.clear_trade(symbol)
 
             log_portfolio_summary(executor, "US")
 
@@ -212,7 +288,7 @@ def run_us_loop(data_feed, strategy, risk_mgr, executor):
             time.sleep(config.LOOP_INTERVAL_SEC)
 
 
-def run_india_loop(strategy, risk_mgr):
+def run_india_loop(strategy, risk_mgr, rs_filter=None):
     from india_broker import IndiaBroker
 
     logger.info("[INDIA] India Market trading loop starting (24/7 process)...")
@@ -237,7 +313,8 @@ def run_india_loop(strategy, risk_mgr):
     paper = india_broker.paper is not None
 
     logger.info(
-        f"[INDIA] Ready | Mode={'PAPER SIM + live NSE data' if paper else 'LIVE REAL MONEY'}"
+        f"[INDIA] Ready | Mode={'PAPER SIM + live NSE data' if paper else 'LIVE REAL MONEY'} "
+        f"| Strategy={strategy.name}"
     )
 
     while True:
@@ -266,7 +343,7 @@ def run_india_loop(strategy, risk_mgr):
             logger.info("=" * 60)
             logger.info(
                 f"[INDIA CYCLE] {now_ist.strftime('%Y-%m-%d %I:%M:%S %p IST')} | "
-                f"Mode={'PAPER' if paper else 'LIVE'}"
+                f"Mode={'PAPER' if paper else 'LIVE'} | Strategy={strategy.name}"
             )
 
             closed = india_broker.check_sl_tp(risk_mgr)
@@ -287,6 +364,8 @@ def run_india_loop(strategy, risk_mgr):
             else:
                 start_of_day_equity = sod
 
+            trade_journal.snapshot_equity("INDIA", current_equity)
+
             if risk_mgr.check_daily_drawdown(current_equity, start_of_day_equity):
                 logger.critical("[INDIA KILL-SWITCH] Trading PAUSED (daily drawdown).")
                 india_broker.cancel_all_open_orders()
@@ -297,20 +376,33 @@ def run_india_loop(strategy, risk_mgr):
                 time.sleep(config.INDIA_LOOP_INTERVAL_SEC)
                 continue
 
+            tradable_window = risk_mgr.is_tradable_session(
+                now_ist, market_open_hm=(9, 15), market_close_hm=(15, 30)
+            )
+
             current_positions = india_broker.get_open_positions()
+
+            bar_cache: dict = {}
+            for symbol in config.INDIA_STOCK_UNIVERSE:
+                df = india_broker.get_historical_bars(symbol)
+                if df is not None and not df.empty:
+                    bar_cache[symbol] = strategy.compute_indicators(df)
+            _refresh_rs_filter(rs_filter, bar_cache)
 
             for symbol in config.INDIA_STOCK_UNIVERSE:
                 logger.info(f"[INDIA] -- Scanning {symbol} " + "-" * (40 - len(symbol)))
 
-                df = india_broker.get_historical_bars(symbol)
+                df = bar_cache.get(symbol)
                 if df is None or df.empty:
                     logger.warning(f"[INDIA] {symbol}: No data — skipping.")
                     continue
 
-                df = strategy.compute_indicators(df)
                 signal = strategy.generate_signal(df, symbol)
+                atr = strategy.latest_atr(df)
 
                 if signal == "BUY":
+                    if not tradable_window:
+                        continue
                     if not risk_mgr.is_position_allowed(symbol, current_positions):
                         continue
 
@@ -323,7 +415,17 @@ def run_india_loop(strategy, risk_mgr):
                         float(account.get("available_cash") or current_equity),
                     )
                     limit_price = quote["ltp"]
-                    qty = risk_mgr.calculate_position_size(sizing_equity, limit_price)
+                    if limit_price <= 0:
+                        continue
+
+                    sl = risk_mgr.get_stop_loss_price(limit_price, atr)
+                    tp = risk_mgr.get_take_profit_price(
+                        limit_price, stop_loss_price=sl, atr=atr
+                    )
+                    stop_dist = limit_price - sl
+                    qty = risk_mgr.calculate_position_size(
+                        sizing_equity, limit_price, stop_distance=stop_dist
+                    )
                     if qty <= 0:
                         continue
 
@@ -331,12 +433,33 @@ def run_india_loop(strategy, risk_mgr):
                         symbol=symbol,
                         qty=qty,
                         limit_price=limit_price,
+                        stop_loss_price=sl,
+                        take_profit_price=tp,
+                        atr=atr,
                     )
                     if order_id:
+                        risk_mgr.register_trade(symbol, limit_price, sl, atr)
+                        trade_journal.record_entry(
+                            "INDIA",
+                            symbol,
+                            qty,
+                            limit_price,
+                            stop_price=sl,
+                            take_profit=tp,
+                            reason="signal_buy",
+                            strategy=strategy.name,
+                            meta={"atr": atr, "order_id": order_id},
+                        )
                         current_positions[symbol] = {"qty": qty}
 
                 elif signal == "SELL" and symbol in current_positions:
-                    india_broker.close_position(symbol)
+                    pos = current_positions[symbol]
+                    px = pos.get("current_price") or pos.get("avg_entry_price")
+                    if india_broker.close_position(symbol):
+                        trade_journal.record_exit(
+                            "INDIA", symbol, float(px), reason="signal_sell"
+                        )
+                        risk_mgr.clear_trade(symbol)
 
             log_india_portfolio_summary(india_broker, "INDIA")
 
@@ -363,6 +486,11 @@ def run_bot():
         f"   India: enabled={config.INDIA_ENABLED} | "
         f"paper_sim={config.INDIA_PAPER} | live_armed={config.LIVE_CONFIRMED}"
     )
+    logger.info(
+        f"   Strategy={config.STRATEGY_NAME} | RS={config.USE_RELATIVE_STRENGTH} | "
+        f"Risk/trade={config.RISK_PER_TRADE:.2%} | ATR_SL={config.ATR_STOP_MULT}x | "
+        f"TP={config.TAKE_PROFIT_R}R | MaxOpen={config.MAX_OPEN_POSITIONS}"
+    )
     logger.info("=" * 70)
 
     if not config.INDIA_ENABLED and (not config.US_ENABLED or config.IS_PLACEHOLDER_KEY):
@@ -374,18 +502,21 @@ def run_bot():
     elif config.INDIA_PAPER:
         logger.info("India PAPER SIM on — live NSE data, fake INR (safe for testing)")
 
+    trade_journal.init_db()
+
     try:
         start_dashboard_in_background(port=5000)
         logger.info("[DASHBOARD] http://localhost:5000  (US / India / Combined tabs)")
     except Exception as e:
         logger.warning(f"Dashboard failed to start: {e}")
 
-    us_strategy = Strategy()
-    india_strategy = Strategy()
-    us_risk = RiskManager()
-    india_risk = RiskManager()
+    us_rs = RelativeStrengthFilter() if config.USE_RELATIVE_STRENGTH else None
+    india_rs = RelativeStrengthFilter() if config.USE_RELATIVE_STRENGTH else None
+    us_strategy = create_strategy("US", rs_filter=us_rs)
+    india_strategy = create_strategy("INDIA", rs_filter=india_rs)
+    us_risk = RiskManager(market="US")
+    india_risk = RiskManager(market="INDIA")
 
-    # US loop in background
     if config.US_ENABLED and not config.IS_PLACEHOLDER_KEY:
         from data_feed import DataFeed
         from execution import TradeExecutor
@@ -395,7 +526,7 @@ def run_bot():
         executor.cancel_all_open_orders()
         us_thread = threading.Thread(
             target=run_us_loop,
-            args=(data_feed, us_strategy, us_risk, executor),
+            args=(data_feed, us_strategy, us_risk, executor, us_rs),
             daemon=True,
             name="USMarketLoop",
         )
@@ -404,11 +535,10 @@ def run_bot():
     else:
         logger.warning("[US] Disabled or missing Alpaca keys")
 
-    # India loop in background
     if config.INDIA_ENABLED:
         india_thread = threading.Thread(
             target=run_india_loop,
-            args=(india_strategy, india_risk),
+            args=(india_strategy, india_risk, india_rs),
             daemon=True,
             name="IndiaMarketLoop",
         )
@@ -417,7 +547,6 @@ def run_bot():
     else:
         logger.warning("[INDIA] Disabled — missing Angel One credentials")
 
-    # Keep process alive 24/7 for Render / local
     logger.info("[MAIN] Process staying alive 24/7 for dashboard + market loops")
     while True:
         time.sleep(60)

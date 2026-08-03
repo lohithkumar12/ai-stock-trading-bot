@@ -31,16 +31,16 @@ function switchMarketTab(tab) {
 
     if (tab === 'us') {
         universeSub.textContent = "Universe: US Large-Caps (Alpaca)";
-        scannerTitle.innerHTML = '<i class="fa-solid fa-radar"></i> 🇺🇸 US Strategy Scanner (Mean Reversion & Smart DCA)';
-        positionsTitle.innerHTML = '<i class="fa-solid fa-list-check"></i> 🇺🇸 US Open Positions';
+        scannerTitle.innerHTML = '<i class="fa-solid fa-radar"></i> US Strategy Scanner';
+        positionsTitle.innerHTML = '<i class="fa-solid fa-list-check"></i> US Open Positions';
     } else if (tab === 'india') {
-        universeSub.textContent = "Universe: Nifty 50 Large-Caps (Angel One)";
-        scannerTitle.innerHTML = '<i class="fa-solid fa-radar"></i> 🇮🇳 India Strategy Scanner (NSE Nifty 50)';
-        positionsTitle.innerHTML = '<i class="fa-solid fa-list-check"></i> 🇮🇳 India Open Positions';
+        universeSub.textContent = "Universe: Nifty Large-Caps (Angel One)";
+        scannerTitle.innerHTML = '<i class="fa-solid fa-radar"></i> India Strategy Scanner (NSE)';
+        positionsTitle.innerHTML = '<i class="fa-solid fa-list-check"></i> India Open Positions';
     } else if (tab === 'combined') {
         universeSub.textContent = "Universe: US + India Markets";
-        scannerTitle.innerHTML = '<i class="fa-solid fa-radar"></i> 🌐 Combined Market Scanner';
-        positionsTitle.innerHTML = '<i class="fa-solid fa-list-check"></i> 🌐 Combined Positions';
+        scannerTitle.innerHTML = '<i class="fa-solid fa-radar"></i> Combined Market Scanner';
+        positionsTitle.innerHTML = '<i class="fa-solid fa-list-check"></i> Combined Positions';
     }
 
     fetchCurrentTabData();
@@ -218,6 +218,8 @@ function updateStatusUI(data, currencySymbol, formatter) {
 
     document.getElementById("last-updated").textContent = `Updated: ${data.timestamp.split(' ')[1]}`;
 
+    updatePerformanceUI(data.performance, data.open_risk_pct, data.strategy);
+
     if (data.equity_history && data.equity_history.length > 0) {
         const labels = data.equity_history.map(pt => pt.timestamp);
         const values = data.equity_history.map(pt => pt.equity);
@@ -225,6 +227,32 @@ function updateStatusUI(data, currencySymbol, formatter) {
         equityChart.data.datasets[0].data = values;
         equityChart.update();
     }
+}
+
+/* ── Performance metrics ────────────────────────────────────────────────── */
+function updatePerformanceUI(perf, openRiskPct, strategyName) {
+    if (!perf) return;
+    const wr = document.getElementById("win-rate-val");
+    const pf = document.getElementById("profit-factor-val");
+    const dd = document.getElementById("max-dd-val");
+    const risk = document.getElementById("open-risk-val");
+    if (!wr) return;
+
+    wr.textContent = `${((perf.win_rate || 0) * 100).toFixed(1)}%`;
+    document.getElementById("trades-count-sub").textContent =
+        `${perf.trades || 0} closed / ${perf.open_trades || 0} open`;
+
+    pf.textContent = perf.profit_factor_display != null ? String(perf.profit_factor_display) : "—";
+    document.getElementById("net-pnl-sub").textContent =
+        `Net PnL: ${(perf.net_pnl >= 0 ? "+" : "")}${(perf.net_pnl || 0).toFixed(2)}`;
+
+    dd.textContent = `${((perf.max_drawdown || 0) * 100).toFixed(2)}%`;
+    document.getElementById("strategy-sub").textContent =
+        `Strategy: ${strategyName || "—"}`;
+
+    risk.textContent = openRiskPct != null
+        ? `${(openRiskPct * 100).toFixed(2)}%`
+        : "—";
 }
 
 /* ── Update India Status UI ─────────────────────────────────────────────── */
@@ -263,6 +291,8 @@ function updateIndiaStatusUI(data) {
 
     document.getElementById("last-updated").textContent = `Updated: ${data.timestamp.split(' ')[1]}`;
 
+    updatePerformanceUI(data.performance, data.open_risk_pct, data.strategy);
+
     if (data.equity_history && data.equity_history.length > 0) {
         const labels = data.equity_history.map(pt => pt.timestamp);
         const values = data.equity_history.map(pt => pt.equity);
@@ -300,6 +330,14 @@ function updateCombinedStatusUI(data) {
         equityChart.data.datasets[0].data = data.equity_history.map(pt => pt.equity);
         equityChart.update();
     }
+
+    // Combined performance from journal (all markets)
+    fetch('/api/performance')
+        .then(r => r.ok ? r.json() : null)
+        .then(perf => {
+            if (perf) updatePerformanceUI(perf.stats, perf.open_risk_pct, perf.strategy);
+        })
+        .catch(() => {});
 }
 
 function renderIndiaDisabledState(msg) {
@@ -390,6 +428,14 @@ function updateScannerUI(scannerList, formatter) {
                     <div class="ind-row">
                         <span>Upper BB:</span>
                         <span class="ind-val">${item.bbu ? formatter(item.bbu) : '-'}</span>
+                    </div>
+                    <div class="ind-row">
+                        <span>ATR:</span>
+                        <span class="ind-val">${item.atr != null ? item.atr : '-'}</span>
+                    </div>
+                    <div class="ind-row">
+                        <span>ADX:</span>
+                        <span class="ind-val">${item.adx != null ? item.adx : '-'}</span>
                     </div>
                 </div>
             </div>

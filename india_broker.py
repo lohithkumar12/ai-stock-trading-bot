@@ -112,6 +112,7 @@ class IndiaBroker:
             return False
 
     def ensure_session(self):
+        """Re-login on missing session, ~12h expiry, or auth-looking errors."""
         if not self._logged_in:
             self.login()
             return
@@ -119,8 +120,26 @@ class IndiaBroker:
         if self._session_time:
             elapsed = datetime.now() - self._session_time
             if elapsed > timedelta(hours=12):
-                logger.info("Angel One session expired — re-authenticating...")
+                logger.info("Angel One session expired (~12h) — re-authenticating...")
                 self.login()
+
+    def _handle_api_error(self, context: str, err) -> bool:
+        """
+        Detect session/rate-limit issues. Returns True if caller should retry once.
+        """
+        msg = str(err).lower()
+        if any(
+            k in msg
+            for k in ("token", "jwt", "unauthorized", "session", "login", "auth")
+        ):
+            logger.warning(f"{context}: session issue — re-login")
+            self._logged_in = False
+            return self.login()
+        if any(k in msg for k in ("rate", "limit", "too many", "429", "access denied")):
+            logger.warning(f"{context}: rate limited — backing off 2s")
+            time.sleep(2.0)
+            return True
+        return False
 
     @property
     def is_logged_in(self) -> bool:
@@ -245,6 +264,22 @@ class IndiaBroker:
                 return None
 
         except Exception as e:
+            if self._handle_api_error(f"{symbol} candles", e):
+                try:
+                    result = self.smart_api.getCandleData(historic_params)
+                    if result and result.get("status") and result.get("data"):
+                        candles = result["data"]
+                        df = pd.DataFrame(
+                            candles,
+                            columns=["timestamp", "open", "high", "low", "close", "volume"],
+                        )
+                        df["timestamp"] = pd.to_datetime(df["timestamp"])
+                        df.set_index("timestamp", inplace=True)
+                        df = df.astype(float)
+                        self._candle_cache[symbol] = (time.time(), df)
+                        return df
+                except Exception as e2:
+                    logger.error(f"{symbol}: candle retry failed: {e2}")
             logger.error(f"{symbol}: Angel One historical data error: {e}", exc_info=True)
             if symbol in self._candle_cache:
                 return self._candle_cache[symbol][1]
@@ -416,6 +451,9 @@ class IndiaBroker:
         limit_price: float,
         place_stoploss: bool = True,
         stop_loss_pct: float | None = None,
+        stop_loss_price: float | None = None,
+        take_profit_price: float | None = None,
+        atr: float | None = None,
     ) -> str | None:
         if not self._assert_live_allowed(f"BUY {symbol}"):
             return None
@@ -424,11 +462,23 @@ class IndiaBroker:
             logger.error(f"Invalid buy params for {symbol}: qty={qty} price={limit_price}")
             return None
 
+        # Resolve SL for paper + live
+        if stop_loss_price is None:
+            sl_pct = stop_loss_pct if stop_loss_pct is not None else config.STOP_LOSS_PCT
+            stop_loss_price = round(limit_price * (1 - sl_pct), 2)
+
         # ----- PAPER SIM (live LTP, fake fill) -----
         if self.paper is not None:
             quote = self.get_latest_quote(symbol)
             fill = float(quote["ltp"]) if quote else float(limit_price)
-            return self.paper.buy(symbol, qty, fill)
+            return self.paper.buy(
+                symbol,
+                qty,
+                fill,
+                stop_loss=stop_loss_price,
+                take_profit=take_profit_price,
+                atr=atr,
+            )
 
         # ----- LIVE REAL ORDERS -----
         self.ensure_session()
@@ -469,14 +519,28 @@ class IndiaBroker:
                 f"Limit={entry_price:.2f} | Order ID={order_id}"
             )
 
-            if place_stoploss:
-                sl_pct = stop_loss_pct if stop_loss_pct is not None else config.STOP_LOSS_PCT
-                sl_trigger = round(entry_price * (1 - sl_pct), 2)
-                self.place_stoploss_order(symbol, qty, sl_trigger)
+            if place_stoploss and stop_loss_price:
+                self.place_stoploss_order(symbol, qty, stop_loss_price)
 
             return order_id
 
         except Exception as e:
+            if self._handle_api_error(f"BUY {symbol}", e) and not getattr(
+                self, "_buy_retrying", False
+            ):
+                self._buy_retrying = True
+                try:
+                    return self.place_buy_order(
+                        symbol,
+                        qty,
+                        limit_price,
+                        place_stoploss=place_stoploss,
+                        stop_loss_price=stop_loss_price,
+                        take_profit_price=take_profit_price,
+                        atr=atr,
+                    )
+                finally:
+                    self._buy_retrying = False
             logger.error(f"Failed to place BUY order for {symbol}: {e}", exc_info=True)
             return None
 
@@ -623,31 +687,81 @@ class IndiaBroker:
         return False
 
     def check_sl_tp(self, risk_mgr) -> list[str]:
+        """
+        Software SL/TP monitor (critical for paper; backup for live).
+        Uses stored ATR levels when present, updates trailing stops via risk_mgr.
+        """
         closed_symbols = []
         positions = self.get_open_positions()
 
         for symbol, pos in positions.items():
-            entry_price = pos["avg_entry_price"]
-            current_price = pos["current_price"]
+            entry_price = float(pos["avg_entry_price"])
+            current_price = float(pos["current_price"])
+            atr = pos.get("atr")
+            if atr is not None:
+                try:
+                    atr = float(atr)
+                except (TypeError, ValueError):
+                    atr = None
 
-            sl_price = risk_mgr.get_stop_loss_price(entry_price)
-            tp_price = risk_mgr.get_take_profit_price(entry_price)
+            # Prefer stored levels; else derive from risk manager
+            stored_sl = pos.get("stop_loss")
+            stored_tp = pos.get("take_profit")
 
+            if stored_sl is not None:
+                sl_price = float(stored_sl)
+            else:
+                sl_price = risk_mgr.get_stop_loss_price(entry_price, atr)
+
+            if stored_tp is not None:
+                tp_price = float(stored_tp)
+            else:
+                tp_price = risk_mgr.get_take_profit_price(
+                    entry_price, stop_loss_price=sl_price, atr=atr
+                )
+
+            # Register + trail
+            if symbol not in getattr(risk_mgr, "_trade_meta", {}):
+                risk_mgr.register_trade(symbol, entry_price, sl_price, atr)
+
+            trailed = risk_mgr.update_trailing_stop(symbol, current_price, atr)
+            if trailed is not None and trailed > sl_price:
+                sl_price = trailed
+                if self.paper is not None:
+                    self.paper.update_position_meta(
+                        symbol,
+                        stop_loss=sl_price,
+                        peak_price=max(
+                            float(pos.get("peak_price") or entry_price),
+                            current_price,
+                        ),
+                    )
+
+            reason = None
             if current_price <= sl_price:
+                reason = "stop_loss"
                 logger.warning(
-                    f"[INDIA SL] {symbol} hit stop-loss! "
-                    f"Entry={entry_price:.2f} Current={current_price:.2f} SL={sl_price:.2f}"
+                    f"[INDIA SL] {symbol} hit stop! "
+                    f"Entry={entry_price:.2f} Px={current_price:.2f} SL={sl_price:.2f}"
                 )
-                if self.close_position(symbol):
-                    closed_symbols.append(symbol)
-
             elif current_price >= tp_price:
+                reason = "take_profit"
                 logger.info(
-                    f"[INDIA TP] {symbol} hit take-profit! "
-                    f"Entry={entry_price:.2f} Current={current_price:.2f} TP={tp_price:.2f}"
+                    f"[INDIA TP] {symbol} hit target! "
+                    f"Entry={entry_price:.2f} Px={current_price:.2f} TP={tp_price:.2f}"
                 )
-                if self.close_position(symbol):
-                    closed_symbols.append(symbol)
+
+            if reason and self.close_position(symbol):
+                closed_symbols.append(symbol)
+                risk_mgr.clear_trade(symbol)
+                try:
+                    import trade_journal
+
+                    trade_journal.record_exit(
+                        "INDIA", symbol, current_price, reason=reason
+                    )
+                except Exception as je:
+                    logger.debug(f"Journal exit skip: {je}")
 
         return closed_symbols
 

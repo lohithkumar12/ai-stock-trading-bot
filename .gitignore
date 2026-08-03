@@ -4,6 +4,10 @@
 # Virtual India paper portfolio state
 india_paper_portfolio.json
 
+# Trade journal (local SQLite)
+trade_journal.db
+*.db
+
 # Python caches
 __pycache__/
 *.pyc
