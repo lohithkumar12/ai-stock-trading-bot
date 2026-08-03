@@ -552,7 +552,8 @@ def pd_isna(val):
 
 @app.route("/api/logs")
 def get_logs():
-    log_file = "trading_bot.log"
+    # main.py writes to logs/trading_bot.log — keep paths in sync
+    log_file = os.path.join("logs", "trading_bot.log")
     if not os.path.exists(log_file):
         return jsonify({"logs": ["Log file not created yet. Run the main bot to generate logs."]})
 
