@@ -4,37 +4,29 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>AI Quant Dashboard — US & India Markets</title>
-    <!-- Google Fonts & Icons -->
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-    <!-- Chart.js -->
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 </head>
 <body>
     <div class="app-container">
-        <!-- Header -->
         <header class="navbar">
             <div class="logo">
                 <i class="fa-solid fa-robot logo-icon"></i>
                 <div class="logo-text">
                     <h1>AI Quant Dashboard</h1>
-                    <span class="sub">Automated US & India Trading Engine</span>
+                    <span class="sub">US & India Trading Engine</span>
                 </div>
             </div>
 
-            <!-- Market Tab Switcher -->
             <div class="market-tabs">
                 <button class="tab-btn active" id="tab-us" onclick="switchMarketTab('us')">
                     🇺🇸 US Markets
                 </button>
                 <button class="tab-btn" id="tab-india" onclick="switchMarketTab('india')">
                     🇮🇳 India (NSE)
-                </button>
-                <button class="tab-btn" id="tab-combined" onclick="switchMarketTab('combined')">
-                    🌐 Combined View
                 </button>
             </div>
 
@@ -51,19 +43,13 @@
             </div>
 
             <div class="nav-actions">
-                <button class="btn btn-secondary" onclick="fetchCurrentTabData()">
-                    <i class="fa-solid fa-rotate"></i> Refresh
-                </button>
                 <button class="btn btn-danger" id="kill-switch-btn" onclick="toggleKillSwitch()">
                     <i class="fa-solid fa-power-off"></i> Kill Switch
                 </button>
             </div>
         </header>
 
-        <!-- Main Content -->
         <main class="dashboard-grid">
-
-            <!-- KPI Cards Row -->
             <section class="kpi-row">
                 <div class="kpi-card">
                     <div class="kpi-icon blue"><i class="fa-solid fa-wallet"></i></div>
@@ -102,79 +88,19 @@
                 </div>
             </section>
 
-            <!-- Performance Metrics -->
-            <section class="kpi-row" id="perf-row">
-                <div class="kpi-card">
-                    <div class="kpi-icon green"><i class="fa-solid fa-percentage"></i></div>
-                    <div class="kpi-info">
-                        <span class="kpi-label">Win Rate</span>
-                        <h2 class="kpi-value" id="win-rate-val">—</h2>
-                        <span class="kpi-sub" id="trades-count-sub">0 closed trades</span>
-                    </div>
-                </div>
-                <div class="kpi-card">
-                    <div class="kpi-icon blue"><i class="fa-solid fa-scale-balanced"></i></div>
-                    <div class="kpi-info">
-                        <span class="kpi-label">Profit Factor</span>
-                        <h2 class="kpi-value" id="profit-factor-val">—</h2>
-                        <span class="kpi-sub" id="net-pnl-sub">Net PnL: —</span>
-                    </div>
-                </div>
-                <div class="kpi-card">
-                    <div class="kpi-icon red"><i class="fa-solid fa-arrow-trend-down"></i></div>
-                    <div class="kpi-info">
-                        <span class="kpi-label">Max Drawdown</span>
-                        <h2 class="kpi-value" id="max-dd-val">—</h2>
-                        <span class="kpi-sub" id="strategy-sub">Strategy: —</span>
-                    </div>
-                </div>
-                <div class="kpi-card">
-                    <div class="kpi-icon purple"><i class="fa-solid fa-shield"></i></div>
-                    <div class="kpi-info">
-                        <span class="kpi-label">Open Risk</span>
-                        <h2 class="kpi-value" id="open-risk-val">—</h2>
-                        <span class="kpi-sub">Of equity to stops</span>
-                    </div>
-                </div>
-            </section>
-
-            <!-- Charts Section -->
-            <section class="charts-grid">
-                <div class="panel chart-panel">
-                    <div class="panel-header">
-                        <h3><i class="fa-solid fa-chart-area"></i> Equity Tracker (Live)</h3>
-                        <span class="timestamp-label" id="last-updated">Updating...</span>
-                    </div>
-                    <div class="chart-container">
-                        <canvas id="equityChart"></canvas>
-                    </div>
-                </div>
-
-                <div class="panel chart-panel doughnut-panel">
-                    <div class="panel-header">
-                        <h3><i class="fa-solid fa-chart-pie"></i> Asset Allocation</h3>
-                    </div>
-                    <div class="chart-container">
-                        <canvas id="allocationChart"></canvas>
-                    </div>
-                </div>
-            </section>
-
-            <!-- Strategy Scanner Grid -->
             <section class="panel">
                 <div class="panel-header">
-                    <h3 id="scanner-title"><i class="fa-solid fa-radar"></i> Strategy Scanner (Mean Reversion & Smart DCA)</h3>
-                    <span class="tag">5-Min Scan Cycle</span>
+                    <h3 id="scanner-title"><i class="fa-solid fa-radar"></i> Strategy Scanner</h3>
+                    <span class="timestamp-label" id="last-updated">Updating...</span>
                 </div>
                 <div class="scanner-grid" id="scanner-container">
                     <div class="loading-state"><i class="fa-solid fa-spinner fa-spin"></i> Loading Stock Indicators...</div>
                 </div>
             </section>
 
-            <!-- Open Positions Table -->
             <section class="panel">
                 <div class="panel-header">
-                    <h3 id="positions-title"><i class="fa-solid fa-list-check"></i> Open Positions & Active Orders</h3>
+                    <h3 id="positions-title"><i class="fa-solid fa-list-check"></i> Open Positions</h3>
                     <span class="count-tag" id="table-count-tag">0 Positions</span>
                 </div>
                 <div class="table-responsive">
@@ -186,32 +112,29 @@
                                 <th>Avg Entry</th>
                                 <th>Current Price</th>
                                 <th>Market Value</th>
-                                <th>Stop-Loss Target</th>
-                                <th>Take-Profit Target</th>
+                                <th>Stop-Loss</th>
+                                <th>Take-Profit</th>
                                 <th>Unrealized P&L</th>
                                 <th>Action</th>
                             </tr>
                         </thead>
                         <tbody id="positions-tbody">
                             <tr>
-                                <td colspan="9" class="empty-state">No open positions currently held. Bot is scanning for entry dips...</td>
+                                <td colspan="9" class="empty-state">No open positions currently held.</td>
                             </tr>
                         </tbody>
                     </table>
                 </div>
             </section>
 
-            <!-- Live Bot Log Terminal -->
             <section class="panel log-panel">
                 <div class="panel-header">
-                    <h3><i class="fa-solid fa-terminal"></i> Unified Execution Log</h3>
-                    <button class="btn-text" onclick="fetchLogs()"><i class="fa-solid fa-rotate-right"></i> Refresh Log</button>
+                    <h3><i class="fa-solid fa-terminal"></i> Execution Log</h3>
                 </div>
                 <div class="log-terminal" id="log-terminal">
                     <div class="log-line info">Initialising dashboard stream...</div>
                 </div>
             </section>
-
         </main>
     </div>
 

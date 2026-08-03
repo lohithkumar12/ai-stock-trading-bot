@@ -315,6 +315,7 @@ def get_india_status():
     market_close_time = now_ist.replace(hour=15, minute=30, second=0, microsecond=0)
     india_market_open = is_weekday and market_open_time <= now_ist <= market_close_time
 
+    india_risk = get_india_risk()
     return jsonify({
         "status": "success",
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -326,10 +327,11 @@ def get_india_status():
         "paper_trading": config.INDIA_PAPER,
         "live_armed": config.LIVE_CONFIRMED,
         "strategy": config.STRATEGY_NAME,
+        "kill_switch_active": india_risk.is_kill_switch_active,
         "equity_history": _india_equity_history,
         "performance": trade_journal.performance_stats("INDIA"),
         "open_risk_pct": round(
-            get_india_risk().open_risk_pct(equity, india_broker.get_open_positions()),
+            india_risk.open_risk_pct(equity, india_broker.get_open_positions()),
             4,
         ),
     })
