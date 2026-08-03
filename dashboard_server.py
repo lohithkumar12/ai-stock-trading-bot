@@ -13,6 +13,7 @@ Supports:
 
 import logging
 import os
+import time
 from datetime import datetime, timezone
 import threading
 
@@ -43,6 +44,13 @@ _india_broker = None
 _india_strategy = None
 _india_risk_mgr = None
 _india_equity_history = []
+
+# Scanner response cache — dashboard used to re-hit Alpaca every few seconds
+SCANNER_CACHE_TTL_SEC = 90.0
+_us_scanner_cache: tuple[float, list] | None = None
+_india_scanner_cache: tuple[float, list] | None = None
+_us_scanner_lock = threading.Lock()
+_india_scanner_lock = threading.Lock()
 
 
 def get_components():
@@ -219,50 +227,62 @@ def get_positions():
 
 @app.route("/api/scanner")
 def get_scanner():
-    _, data_feed, strategy, _ = get_components()
-    if not data_feed or not strategy:
-        return jsonify([])
+    global _us_scanner_cache
 
-    scanner_results = []
-    sma_slow = getattr(strategy.p, "sma_slow", config.SMA_SLOW) if hasattr(strategy, "p") else config.SMA_SLOW
-    sma_fast = getattr(strategy.p, "sma_fast", config.SMA_FAST) if hasattr(strategy, "p") else config.SMA_FAST
-    rsi_period = getattr(strategy.p, "rsi_period", config.RSI_PERIOD) if hasattr(strategy, "p") else config.RSI_PERIOD
+    now = time.time()
+    if _us_scanner_cache and (now - _us_scanner_cache[0]) < SCANNER_CACHE_TTL_SEC:
+        return jsonify(_us_scanner_cache[1])
 
-    for symbol in config.STOCK_UNIVERSE:
-        try:
-            df = data_feed.get_historical_bars(symbol)
-            if df is not None and not df.empty:
-                df = strategy.compute_indicators(df)
-                signal = strategy.generate_signal(df, symbol)
-                latest = df.iloc[-1]
+    with _us_scanner_lock:
+        now = time.time()
+        if _us_scanner_cache and (now - _us_scanner_cache[0]) < SCANNER_CACHE_TTL_SEC:
+            return jsonify(_us_scanner_cache[1])
 
-                scanner_results.append({
-                    "symbol": symbol,
-                    "price": round(float(latest["close"]), 2),
-                    "sma_200": round(float(latest[f"SMA_{sma_slow}"]), 2) if not pd_isna(latest.get(f"SMA_{sma_slow}")) else None,
-                    "sma_20": round(float(latest[f"SMA_{sma_fast}"]), 2) if not pd_isna(latest.get(f"SMA_{sma_fast}")) else None,
-                    "rsi": round(float(latest[f"RSI_{rsi_period}"]), 1) if not pd_isna(latest.get(f"RSI_{rsi_period}")) else None,
-                    "bbl": round(float(latest["BBL"]), 2) if not pd_isna(latest.get("BBL")) else None,
-                    "bbu": round(float(latest["BBU"]), 2) if not pd_isna(latest.get("BBU")) else None,
-                    "atr": round(float(latest["ATR"]), 2) if not pd_isna(latest.get("ATR")) else None,
-                    "adx": round(float(latest["ADX"]), 1) if not pd_isna(latest.get("ADX")) else None,
-                    "signal": signal
-                })
-            else:
+        _, data_feed, strategy, _ = get_components()
+        if not data_feed or not strategy:
+            return jsonify([])
+
+        scanner_results = []
+        sma_slow = getattr(strategy.p, "sma_slow", config.SMA_SLOW) if hasattr(strategy, "p") else config.SMA_SLOW
+        sma_fast = getattr(strategy.p, "sma_fast", config.SMA_FAST) if hasattr(strategy, "p") else config.SMA_FAST
+        rsi_period = getattr(strategy.p, "rsi_period", config.RSI_PERIOD) if hasattr(strategy, "p") else config.RSI_PERIOD
+
+        for symbol in config.STOCK_UNIVERSE:
+            try:
+                df = data_feed.get_historical_bars(symbol)
+                if df is not None and not df.empty:
+                    df = strategy.compute_indicators(df)
+                    signal = strategy.generate_signal(df, symbol)
+                    latest = df.iloc[-1]
+
+                    scanner_results.append({
+                        "symbol": symbol,
+                        "price": round(float(latest["close"]), 2),
+                        "sma_200": round(float(latest[f"SMA_{sma_slow}"]), 2) if not pd_isna(latest.get(f"SMA_{sma_slow}")) else None,
+                        "sma_20": round(float(latest[f"SMA_{sma_fast}"]), 2) if not pd_isna(latest.get(f"SMA_{sma_fast}")) else None,
+                        "rsi": round(float(latest[f"RSI_{rsi_period}"]), 1) if not pd_isna(latest.get(f"RSI_{rsi_period}")) else None,
+                        "bbl": round(float(latest["BBL"]), 2) if not pd_isna(latest.get("BBL")) else None,
+                        "bbu": round(float(latest["BBU"]), 2) if not pd_isna(latest.get("BBU")) else None,
+                        "atr": round(float(latest["ATR"]), 2) if not pd_isna(latest.get("ATR")) else None,
+                        "adx": round(float(latest["ADX"]), 1) if not pd_isna(latest.get("ADX")) else None,
+                        "signal": signal
+                    })
+                else:
+                    scanner_results.append({
+                        "symbol": symbol,
+                        "price": 0.0,
+                        "signal": "NO_DATA"
+                    })
+            except Exception as e:
+                logger.error(f"Error scanning {symbol}: {e}")
                 scanner_results.append({
                     "symbol": symbol,
                     "price": 0.0,
-                    "signal": "NO_DATA"
+                    "signal": "ERROR"
                 })
-        except Exception as e:
-            logger.error(f"Error scanning {symbol}: {e}")
-            scanner_results.append({
-                "symbol": symbol,
-                "price": 0.0,
-                "signal": "ERROR"
-            })
 
-    return jsonify(scanner_results)
+        _us_scanner_cache = (time.time(), scanner_results)
+        return jsonify(scanner_results)
 
 
 # ===========================================================================
@@ -380,53 +400,65 @@ def get_india_positions():
 
 @app.route("/api/india/scanner")
 def get_india_scanner():
+    global _india_scanner_cache
+
     if not config.INDIA_ENABLED:
         return jsonify([])
 
-    india_broker, strategy = get_india_components()
-    if not india_broker or not india_broker.is_logged_in or not strategy:
-        return jsonify([])
+    now = time.time()
+    if _india_scanner_cache and (now - _india_scanner_cache[0]) < SCANNER_CACHE_TTL_SEC:
+        return jsonify(_india_scanner_cache[1])
 
-    sma_slow = getattr(strategy.p, "sma_slow", config.INDIA_SMA_SLOW) if hasattr(strategy, "p") else config.INDIA_SMA_SLOW
-    sma_fast = getattr(strategy.p, "sma_fast", config.INDIA_SMA_FAST) if hasattr(strategy, "p") else config.INDIA_SMA_FAST
-    rsi_period = getattr(strategy.p, "rsi_period", config.INDIA_RSI_PERIOD) if hasattr(strategy, "p") else config.INDIA_RSI_PERIOD
+    with _india_scanner_lock:
+        now = time.time()
+        if _india_scanner_cache and (now - _india_scanner_cache[0]) < SCANNER_CACHE_TTL_SEC:
+            return jsonify(_india_scanner_cache[1])
 
-    scanner_results = []
-    for symbol in config.INDIA_STOCK_UNIVERSE:
-        try:
-            df = india_broker.get_historical_bars(symbol)
-            if df is not None and not df.empty:
-                df = strategy.compute_indicators(df)
-                signal = strategy.generate_signal(df, symbol)
-                latest = df.iloc[-1]
+        india_broker, strategy = get_india_components()
+        if not india_broker or not india_broker.is_logged_in or not strategy:
+            return jsonify([])
 
-                scanner_results.append({
-                    "symbol": symbol,
-                    "price": round(float(latest["close"]), 2),
-                    "sma_200": round(float(latest[f"SMA_{sma_slow}"]), 2) if not pd_isna(latest.get(f"SMA_{sma_slow}")) else None,
-                    "sma_20": round(float(latest[f"SMA_{sma_fast}"]), 2) if not pd_isna(latest.get(f"SMA_{sma_fast}")) else None,
-                    "rsi": round(float(latest[f"RSI_{rsi_period}"]), 1) if not pd_isna(latest.get(f"RSI_{rsi_period}")) else None,
-                    "bbl": round(float(latest["BBL"]), 2) if not pd_isna(latest.get("BBL")) else None,
-                    "bbu": round(float(latest["BBU"]), 2) if not pd_isna(latest.get("BBU")) else None,
-                    "atr": round(float(latest["ATR"]), 2) if not pd_isna(latest.get("ATR")) else None,
-                    "adx": round(float(latest["ADX"]), 1) if not pd_isna(latest.get("ADX")) else None,
-                    "signal": signal
-                })
-            else:
+        sma_slow = getattr(strategy.p, "sma_slow", config.INDIA_SMA_SLOW) if hasattr(strategy, "p") else config.INDIA_SMA_SLOW
+        sma_fast = getattr(strategy.p, "sma_fast", config.INDIA_SMA_FAST) if hasattr(strategy, "p") else config.INDIA_SMA_FAST
+        rsi_period = getattr(strategy.p, "rsi_period", config.INDIA_RSI_PERIOD) if hasattr(strategy, "p") else config.INDIA_RSI_PERIOD
+
+        scanner_results = []
+        for symbol in config.INDIA_STOCK_UNIVERSE:
+            try:
+                df = india_broker.get_historical_bars(symbol)
+                if df is not None and not df.empty:
+                    df = strategy.compute_indicators(df)
+                    signal = strategy.generate_signal(df, symbol)
+                    latest = df.iloc[-1]
+
+                    scanner_results.append({
+                        "symbol": symbol,
+                        "price": round(float(latest["close"]), 2),
+                        "sma_200": round(float(latest[f"SMA_{sma_slow}"]), 2) if not pd_isna(latest.get(f"SMA_{sma_slow}")) else None,
+                        "sma_20": round(float(latest[f"SMA_{sma_fast}"]), 2) if not pd_isna(latest.get(f"SMA_{sma_fast}")) else None,
+                        "rsi": round(float(latest[f"RSI_{rsi_period}"]), 1) if not pd_isna(latest.get(f"RSI_{rsi_period}")) else None,
+                        "bbl": round(float(latest["BBL"]), 2) if not pd_isna(latest.get("BBL")) else None,
+                        "bbu": round(float(latest["BBU"]), 2) if not pd_isna(latest.get("BBU")) else None,
+                        "atr": round(float(latest["ATR"]), 2) if not pd_isna(latest.get("ATR")) else None,
+                        "adx": round(float(latest["ADX"]), 1) if not pd_isna(latest.get("ADX")) else None,
+                        "signal": signal
+                    })
+                else:
+                    scanner_results.append({
+                        "symbol": symbol,
+                        "price": 0.0,
+                        "signal": "NO_DATA"
+                    })
+            except Exception as e:
+                logger.error(f"Error scanning India {symbol}: {e}")
                 scanner_results.append({
                     "symbol": symbol,
                     "price": 0.0,
-                    "signal": "NO_DATA"
+                    "signal": "ERROR"
                 })
-        except Exception as e:
-            logger.error(f"Error scanning India {symbol}: {e}")
-            scanner_results.append({
-                "symbol": symbol,
-                "price": 0.0,
-                "signal": "ERROR"
-            })
 
-    return jsonify(scanner_results)
+        _india_scanner_cache = (time.time(), scanner_results)
+        return jsonify(scanner_results)
 
 
 @app.route("/api/india/close_position/<symbol>", methods=["POST"])

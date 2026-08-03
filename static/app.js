@@ -3,25 +3,40 @@
    ========================================================================== */
 
 let currentTab = 'us'; // 'us' | 'india'
-let fetchGeneration = 0;
-let activeAbort = null;
+let liveGeneration = 0;
+let scannerGeneration = 0;
+let liveAbort = null;
+let scannerAbort = null;
 
 document.addEventListener("DOMContentLoaded", () => {
-    fetchCurrentTabData();
+    fetchLiveData();
+    fetchScannerData();
     fetchLogs();
-    setInterval(fetchCurrentTabData, 3000);
+    setInterval(fetchLiveData, 3000);
+    setInterval(fetchScannerData, 60000);
     setInterval(fetchLogs, 5000);
 });
 
-function isStale(gen) {
-    return gen !== fetchGeneration;
+function isLiveStale(gen) {
+    return gen !== liveGeneration;
 }
 
-function beginFetch() {
-    if (activeAbort) activeAbort.abort();
-    activeAbort = new AbortController();
-    fetchGeneration += 1;
-    return { gen: fetchGeneration, signal: activeAbort.signal };
+function isScannerStale(gen) {
+    return gen !== scannerGeneration;
+}
+
+function beginLiveFetch() {
+    if (liveAbort) liveAbort.abort();
+    liveAbort = new AbortController();
+    liveGeneration += 1;
+    return { gen: liveGeneration, signal: liveAbort.signal };
+}
+
+function beginScannerFetch() {
+    if (scannerAbort) scannerAbort.abort();
+    scannerAbort = new AbortController();
+    scannerGeneration += 1;
+    return { gen: scannerGeneration, signal: scannerAbort.signal };
 }
 
 function switchMarketTab(tab) {
@@ -46,7 +61,8 @@ function switchMarketTab(tab) {
     }
 
     clearMarketPanels(tab);
-    fetchCurrentTabData();
+    fetchLiveData();
+    fetchScannerData();
 }
 
 function clearMarketPanels(tab) {
@@ -69,59 +85,78 @@ function clearMarketPanels(tab) {
         `<div class="loading-state"><i class="fa-solid fa-spinner fa-spin"></i> Loading ${tab.toUpperCase()} scanner…</div>`;
 }
 
-function fetchCurrentTabData() {
-    const { gen, signal } = beginFetch();
+function fetchLiveData() {
+    const { gen, signal } = beginLiveFetch();
     if (currentTab === 'us') {
-        fetchUSData(gen, signal);
+        fetchUSLive(gen, signal);
     } else {
-        fetchIndiaData(gen, signal);
+        fetchIndiaLive(gen, signal);
     }
 }
 
-async function fetchUSData(gen, signal) {
+function fetchScannerData() {
+    const { gen, signal } = beginScannerFetch();
+    if (currentTab === 'us') {
+        fetchUSScanner(gen, signal);
+    } else {
+        fetchIndiaScanner(gen, signal);
+    }
+}
+
+function fetchCurrentTabData() {
+    fetchLiveData();
+    fetchScannerData();
+}
+
+async function fetchUSLive(gen, signal) {
     try {
-        const [statusRes, positionsRes, scannerRes] = await Promise.all([
+        const [statusRes, positionsRes] = await Promise.all([
             fetch('/api/status', { signal }),
-            fetch('/api/positions', { signal }),
-            fetch('/api/scanner', { signal })
+            fetch('/api/positions', { signal })
         ]);
-        if (isStale(gen)) return;
+        if (isLiveStale(gen)) return;
 
         if (statusRes.ok) {
             const status = await statusRes.json();
-            if (isStale(gen)) return;
+            if (isLiveStale(gen)) return;
             updateStatusUI(status, formatUSD);
         }
 
         if (positionsRes.ok) {
             const positions = await positionsRes.json();
-            if (isStale(gen)) return;
+            if (isLiveStale(gen)) return;
             updatePositionsUI(positions, formatUSD, 'closePosition');
         }
-
-        if (scannerRes.ok) {
-            const scanner = await scannerRes.json();
-            if (isStale(gen)) return;
-            updateScannerUI(scanner, formatUSD);
-        }
     } catch (err) {
-        if (err.name === 'AbortError' || isStale(gen)) return;
-        console.error("Error fetching US dashboard data:", err);
+        if (err.name === 'AbortError' || isLiveStale(gen)) return;
+        console.error("Error fetching US live data:", err);
     }
 }
 
-async function fetchIndiaData(gen, signal) {
+async function fetchUSScanner(gen, signal) {
     try {
-        const [statusRes, positionsRes, scannerRes] = await Promise.all([
+        const scannerRes = await fetch('/api/scanner', { signal });
+        if (isScannerStale(gen) || !scannerRes.ok) return;
+        const scanner = await scannerRes.json();
+        if (isScannerStale(gen)) return;
+        updateScannerUI(scanner, formatUSD);
+    } catch (err) {
+        if (err.name === 'AbortError' || isScannerStale(gen)) return;
+        console.error("Error fetching US scanner:", err);
+    }
+}
+
+async function fetchIndiaLive(gen, signal) {
+    try {
+        const [statusRes, positionsRes] = await Promise.all([
             fetch('/api/india/status', { signal }),
-            fetch('/api/india/positions', { signal }),
-            fetch('/api/india/scanner', { signal })
+            fetch('/api/india/positions', { signal })
         ]);
-        if (isStale(gen)) return;
+        if (isLiveStale(gen)) return;
 
         if (statusRes.ok) {
             const status = await statusRes.json();
-            if (isStale(gen)) return;
+            if (isLiveStale(gen)) return;
             if (status.status === "disabled" || status.status === "error") {
                 renderIndiaDisabledState(status.message);
                 return;
@@ -133,19 +168,26 @@ async function fetchIndiaData(gen, signal) {
 
         if (positionsRes.ok) {
             const positions = await positionsRes.json();
-            if (isStale(gen)) return;
+            if (isLiveStale(gen)) return;
             updatePositionsUI(positions, formatINR, 'closeIndiaPosition');
         }
-
-        if (scannerRes.ok) {
-            const scanner = await scannerRes.json();
-            if (isStale(gen)) return;
-            updateScannerUI(scanner, formatINR);
-        }
     } catch (err) {
-        if (err.name === 'AbortError' || isStale(gen)) return;
-        console.error("Error fetching India dashboard data:", err);
+        if (err.name === 'AbortError' || isLiveStale(gen)) return;
+        console.error("Error fetching India live data:", err);
         renderIndiaDisabledState("Add Angel One keys in environment");
+    }
+}
+
+async function fetchIndiaScanner(gen, signal) {
+    try {
+        const scannerRes = await fetch('/api/india/scanner', { signal });
+        if (isScannerStale(gen) || !scannerRes.ok) return;
+        const scanner = await scannerRes.json();
+        if (isScannerStale(gen)) return;
+        updateScannerUI(scanner, formatINR);
+    } catch (err) {
+        if (err.name === 'AbortError' || isScannerStale(gen)) return;
+        console.error("Error fetching India scanner:", err);
     }
 }
 
