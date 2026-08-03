@@ -322,12 +322,12 @@ def run_us_loop(data_feed, strategy, risk_mgr, executor, rs_filter=None):
 
 
 def run_india_loop(strategy, risk_mgr, rs_filter=None):
-    from india_broker import IndiaBroker
+    from india_broker import get_shared_india_broker
 
     logger.info("[INDIA] India Market trading loop starting (24/7 process)...")
 
     try:
-        india_broker = IndiaBroker()
+        india_broker = get_shared_india_broker(auto_login=True)
     except Exception as e:
         logger.error(f"[INDIA] Failed to initialize India broker: {e}")
         return
@@ -335,11 +335,12 @@ def run_india_loop(strategy, risk_mgr, rs_filter=None):
     if not india_broker.is_logged_in:
         logger.error(
             f"[INDIA] Login failed: {india_broker.last_error}. "
-            "Need Angel One login for LIVE NSE data even in paper mode."
+            "Will keep process alive and retry after cooldown "
+            "(do not restart the container repeatedly)."
         )
-        return
-
-    india_broker.cancel_all_open_orders()
+        # Do not exit — cooldown + ensure_session will retry later
+    else:
+        india_broker.cancel_all_open_orders()
 
     start_of_day_equity = None
     last_reset_date = None
@@ -369,9 +370,20 @@ def run_india_loop(strategy, risk_mgr, rs_filter=None):
                     f"Bot still alive — next check in {config.INDIA_LOOP_INTERVAL_SEC}s..."
                 )
                 if now_ist.hour == 9 and 10 <= now_ist.minute < 15:
+                    # Single attempt; login() no-ops during cooldown
                     india_broker.login()
                 time.sleep(config.INDIA_LOOP_INTERVAL_SEC)
                 continue
+
+            if not india_broker.is_logged_in:
+                india_broker.ensure_session()
+                if not india_broker.is_logged_in:
+                    logger.warning(
+                        f"[INDIA] Not logged in ({india_broker.last_error}) — "
+                        f"skipping cycle"
+                    )
+                    time.sleep(config.INDIA_LOOP_INTERVAL_SEC)
+                    continue
 
             logger.info("=" * 60)
             logger.info(

@@ -77,15 +77,15 @@ def get_components():
 
 
 def get_india_components():
-    """Initialize India market components (Angel One)."""
+    """Initialize India market components (Angel One) — shared broker singleton."""
     global _india_broker, _india_strategy, _india_risk_mgr
     if not config.INDIA_ENABLED:
         return None, None
 
     if _india_broker is None:
         try:
-            from india_broker import IndiaBroker
-            _india_broker = IndiaBroker()
+            from india_broker import get_shared_india_broker
+            _india_broker = get_shared_india_broker(auto_login=True)
             _india_strategy = create_strategy("INDIA")
             _india_risk_mgr = RiskManager(market="INDIA")
         except Exception as e:

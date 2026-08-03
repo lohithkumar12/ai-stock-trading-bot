@@ -6,6 +6,8 @@ Wraps Angel One's SmartAPI for Indian stock trading (NSE).
 Handles:
   - Auto-login with TOTP generation (no manual OTP needed)
   - Session refresh on token expiry
+  - Login cooldown after Angel rate-limit responses
+  - Shared singleton so dashboard + trading loop share one session
   - Historical candle data retrieval → pandas DataFrame (cached)
   - Real-time LTP (Last Traded Price) quotes
   - Order placement (NORMAL variety with DELIVERY product)
@@ -15,6 +17,7 @@ Uses smartapi-python SDK + pyotp for TOTP auto-generation.
 """
 
 import logging
+import threading
 import time
 from datetime import datetime, timedelta
 
@@ -33,6 +36,38 @@ from india_paper import IndiaPaperPortfolio
 
 logger = logging.getLogger(__name__)
 
+# Angel One login rate limits are aggressive — back off hard after a deny.
+LOGIN_COOLDOWN_BASE_SEC = 120.0
+LOGIN_COOLDOWN_MAX_SEC = 900.0  # 15 minutes
+
+_shared_broker: "IndiaBroker | None" = None
+_shared_lock = threading.Lock()
+
+
+def get_shared_india_broker(auto_login: bool = True) -> "IndiaBroker":
+    """Process-wide singleton — bot loop and dashboard must share one session."""
+    global _shared_broker
+    with _shared_lock:
+        if _shared_broker is None:
+            _shared_broker = IndiaBroker(auto_login=auto_login)
+        return _shared_broker
+
+
+def _is_rate_limit_message(msg: str) -> bool:
+    m = (msg or "").lower()
+    return any(
+        k in m
+        for k in (
+            "exceeding access rate",
+            "access rate",
+            "access denied",
+            "too many",
+            "rate limit",
+            "rate-limit",
+            "429",
+        )
+    )
+
 
 class IndiaBroker:
     """
@@ -45,7 +80,7 @@ class IndiaBroker:
       - Real CNC orders hit your Angel One account
     """
 
-    def __init__(self):
+    def __init__(self, auto_login: bool = True):
         """Initialize the Angel One SmartAPI client."""
         self.api_key = config.ANGEL_API_KEY
         self.client_id = config.ANGEL_CLIENT_ID
@@ -60,59 +95,100 @@ class IndiaBroker:
         self.last_error = ""
         self._last_candle_call_time = 0
         self._candle_cache = {}  # {symbol: (timestamp, dataframe)}
+        self._login_cooldown_until = 0.0
+        self._login_cooldown_sec = LOGIN_COOLDOWN_BASE_SEC
+        self._login_lock = threading.Lock()
 
         self.paper = IndiaPaperPortfolio() if config.INDIA_PAPER else None
         mode = "PAPER SIM (live NSE data, fake INR)" if self.paper else "LIVE REAL MONEY"
         logger.info(f"IndiaBroker mode: {mode}")
 
-        # Attempt login on initialization (needed for live market data either way)
-        self.login()
+        if auto_login:
+            self.login()
 
     # -----------------------------------------------------------------------
     # Authentication
     # -----------------------------------------------------------------------
+    def _arm_login_cooldown(self, reason: str) -> None:
+        self._login_cooldown_until = time.time() + self._login_cooldown_sec
+        logger.warning(
+            f"Angel One login cooldown {self._login_cooldown_sec:.0f}s "
+            f"(until rate window clears): {reason}"
+        )
+        # Escalate for repeated hits
+        self._login_cooldown_sec = min(
+            LOGIN_COOLDOWN_MAX_SEC, self._login_cooldown_sec * 1.5
+        )
+
+    def _clear_login_cooldown(self) -> None:
+        self._login_cooldown_until = 0.0
+        self._login_cooldown_sec = LOGIN_COOLDOWN_BASE_SEC
+
     def login(self) -> bool:
-        try:
-            if not self.totp_secret or not self.client_id or not self.pin:
-                self.last_error = "Missing Angel One credentials in Environment"
+        with self._login_lock:
+            now = time.time()
+            if now < self._login_cooldown_until:
+                remaining = int(self._login_cooldown_until - now)
+                self.last_error = (
+                    f"Angel One login cooling down ({remaining}s left after rate limit)"
+                )
+                logger.info(self.last_error)
                 self._logged_in = False
                 return False
 
-            clean_secret = self.totp_secret.replace(" ", "").upper()
-            totp = pyotp.TOTP(clean_secret).now()
+            try:
+                if not self.totp_secret or not self.client_id or not self.pin:
+                    self.last_error = "Missing Angel One credentials in Environment"
+                    self._logged_in = False
+                    return False
 
-            session_data = self.smart_api.generateSession(
-                self.client_id, self.pin, totp
-            )
+                clean_secret = self.totp_secret.replace(" ", "").upper()
+                totp = pyotp.TOTP(clean_secret).now()
 
-            if session_data and session_data.get("status"):
-                self.auth_token = session_data["data"]["jwtToken"]
-                self.feed_token = session_data["data"].get("feedToken")
-                self._session_time = datetime.now()
-                self._logged_in = True
-                self.last_error = ""
-
-                logger.info(
-                    f"Angel One LOGIN SUCCESS | Client: {self.client_id} | "
-                    f"Session active"
+                session_data = self.smart_api.generateSession(
+                    self.client_id, self.pin, totp
                 )
-                return True
-            else:
-                msg = session_data.get("message", "Unknown login error") if session_data else "No response from Angel One"
+
+                if session_data and session_data.get("status"):
+                    self.auth_token = session_data["data"]["jwtToken"]
+                    self.feed_token = session_data["data"].get("feedToken")
+                    self._session_time = datetime.now()
+                    self._logged_in = True
+                    self.last_error = ""
+                    self._clear_login_cooldown()
+
+                    logger.info(
+                        f"Angel One LOGIN SUCCESS | Client: {self.client_id} | "
+                        f"Session active"
+                    )
+                    return True
+
+                msg = (
+                    session_data.get("message", "Unknown login error")
+                    if session_data
+                    else "No response from Angel One"
+                )
                 self.last_error = msg
                 logger.error(f"Angel One LOGIN FAILED: {msg}")
                 self._logged_in = False
+                if _is_rate_limit_message(msg):
+                    self._arm_login_cooldown(msg)
                 return False
 
-        except Exception as e:
-            err_msg = str(e)
-            self.last_error = f"Login Exception: {err_msg}"
-            logger.error(f"Angel One LOGIN ERROR: {e}", exc_info=True)
-            self._logged_in = False
-            return False
+            except Exception as e:
+                err_msg = str(e)
+                self.last_error = f"Login Exception: {err_msg}"
+                logger.error(f"Angel One LOGIN ERROR: {e}", exc_info=True)
+                self._logged_in = False
+                if _is_rate_limit_message(err_msg):
+                    self._arm_login_cooldown(err_msg)
+                return False
 
     def ensure_session(self):
-        """Re-login on missing session, ~12h expiry, or auth-looking errors."""
+        """Re-login on missing session or ~12h expiry — respects login cooldown."""
+        if time.time() < self._login_cooldown_until:
+            return
+
         if not self._logged_in:
             self.login()
             return
@@ -128,6 +204,13 @@ class IndiaBroker:
         Detect session/rate-limit issues. Returns True if caller should retry once.
         """
         msg = str(err).lower()
+        # Rate limits first — never treat as auth and spam generateSession
+        if _is_rate_limit_message(msg):
+            wait = min(30.0, self._login_cooldown_sec)
+            logger.warning(f"{context}: Angel rate limited — backing off {wait:.0f}s")
+            self._arm_login_cooldown(str(err))
+            time.sleep(wait)
+            return False
         if any(
             k in msg
             for k in ("token", "jwt", "unauthorized", "session", "login", "auth")
@@ -135,10 +218,6 @@ class IndiaBroker:
             logger.warning(f"{context}: session issue — re-login")
             self._logged_in = False
             return self.login()
-        if any(k in msg for k in ("rate", "limit", "too many", "429", "access denied")):
-            logger.warning(f"{context}: rate limited — backing off 2s")
-            time.sleep(2.0)
-            return True
         return False
 
     @property
