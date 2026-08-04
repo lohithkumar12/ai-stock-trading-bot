@@ -59,7 +59,7 @@ function switchMarketTab(tab) {
         scannerTitle.innerHTML = '<i class="fa-solid fa-radar"></i> US Strategy Scanner';
         positionsTitle.innerHTML = '<i class="fa-solid fa-list-check"></i> US Open Positions';
     } else {
-        universeSub.textContent = "Universe: Nifty Large-Caps (Angel One)";
+        universeSub.textContent = "Universe: Nifty Large-Caps (Dhan / NSE)";
         scannerTitle.innerHTML = '<i class="fa-solid fa-radar"></i> India Strategy Scanner (NSE)';
         positionsTitle.innerHTML = '<i class="fa-solid fa-list-check"></i> India Open Positions';
     }
@@ -168,7 +168,7 @@ async function fetchIndiaLive(gen, signal) {
             }
             updateIndiaStatusUI(status);
         } else {
-            renderIndiaDisabledState("Add Angel One keys in environment");
+            renderIndiaDisabledState("Add Dhan keys in environment");
         }
 
         if (positionsRes.ok) {
@@ -179,7 +179,7 @@ async function fetchIndiaLive(gen, signal) {
     } catch (err) {
         if (err.name === 'AbortError' || isLiveStale(gen)) return;
         console.error("Error fetching India live data:", err);
-        renderIndiaDisabledState("Add Angel One keys in environment");
+        renderIndiaDisabledState("Add Dhan keys in environment");
     }
 }
 
@@ -269,7 +269,7 @@ function updateIndiaStatusUI(data) {
     if (!data || data.status === "error") return;
 
     document.getElementById("equity-val").textContent = formatINR(data.equity);
-    document.getElementById("equity-sub").textContent = "Angel One Account";
+    document.getElementById("equity-sub").textContent = "India Broker Account";
 
     const dailyPlEl = document.getElementById("daily-pl-val");
     const dailyPctEl = document.getElementById("daily-pl-pct");
@@ -309,8 +309,8 @@ function updateIndiaStatusUI(data) {
 }
 
 function renderIndiaDisabledState(msg) {
-    document.getElementById("equity-val").textContent = "Angel One Pending";
-    document.getElementById("equity-sub").textContent = msg || "Add Angel One credentials to environment";
+    document.getElementById("equity-val").textContent = "India Broker Pending";
+    document.getElementById("equity-sub").textContent = msg || "Add Dhan credentials to environment";
     document.getElementById("daily-pl-val").textContent = "₹0.00";
     document.getElementById("daily-pl-pct").textContent = "0.00%";
     document.getElementById("buying-power-val").textContent = "₹0.00";
@@ -318,7 +318,7 @@ function renderIndiaDisabledState(msg) {
 
     const marketStatusEl = document.getElementById("market-status");
     const marketBadge = document.getElementById("market-badge");
-    marketStatusEl.textContent = "Angel One Keys Needed";
+    marketStatusEl.textContent = "Dhan Keys Needed";
     marketBadge.style.color = "var(--warning)";
     marketBadge.style.background = "var(--warning-bg)";
 }

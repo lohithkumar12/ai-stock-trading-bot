@@ -1,13 +1,9 @@
 """
 india_instruments.py — NSE Instrument Token Mapping
 =====================================================
-Maps NSE stock trading symbols to Angel One SmartAPI symbol tokens.
-
-Angel One requires a numeric 'symboltoken' for every API call (data, orders).
-This module provides a hardcoded lookup for our target Nifty 50 large-caps,
-plus a helper to refresh tokens from the Angel One master file if needed.
-
-Token Source: https://margincalculator.angelone.in/OpenAPI_File/files/OpenAPIScripMaster.json
+Maps NSE stock symbols to numeric security IDs used by Dhan (security_id)
+and Angel One (symboltoken). These IDs align for common NSE equities
+(e.g. HDFCBANK=1333).
 """
 
 import logging

@@ -77,14 +77,14 @@ def get_components():
 
 
 def get_india_components():
-    """Initialize India market components (Angel One) — shared broker singleton."""
+    """Initialize India market components — shared broker singleton."""
     global _india_broker, _india_strategy, _india_risk_mgr
     if not config.INDIA_ENABLED:
         return None, None
 
     if _india_broker is None:
         try:
-            from india_broker import get_shared_india_broker
+            from india_client import get_shared_india_broker
             _india_broker = get_shared_india_broker(auto_login=True)
             _india_strategy = create_strategy("INDIA")
             _india_risk_mgr = RiskManager(market="INDIA")
@@ -317,7 +317,11 @@ def get_india_status():
 
     india_broker, _ = get_india_components()
     if not india_broker or not india_broker.is_logged_in:
-        err_msg = india_broker.last_error if (india_broker and india_broker.last_error) else "Angel One authentication failed. Verify keys in Render Environment."
+        err_msg = (
+            india_broker.last_error
+            if (india_broker and india_broker.last_error)
+            else f"{config.INDIA_BROKER} authentication failed. Verify DHAN_* / ANGEL_* keys."
+        )
         return jsonify({
             "status": "error",
             "message": err_msg
@@ -325,7 +329,11 @@ def get_india_status():
 
     account_info = india_broker.get_account_info()
     if not account_info:
-        err_msg = india_broker.last_error if india_broker.last_error else "Unable to fetch Angel One account info."
+        err_msg = (
+            india_broker.last_error
+            if india_broker.last_error
+            else f"Unable to fetch {config.INDIA_BROKER} account info."
+        )
         return jsonify({
             "status": "error",
             "message": err_msg
@@ -369,6 +377,7 @@ def get_india_status():
         "used_margin": account_info.get("used_margin", 0),
         "market_open": india_market_open,
         "logged_in": india_broker.is_logged_in,
+        "broker": config.INDIA_BROKER,
         "paper_trading": config.INDIA_PAPER,
         "live_armed": config.LIVE_CONFIRMED,
         "strategy": config.STRATEGY_NAME,

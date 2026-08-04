@@ -2,9 +2,8 @@
 config.py — Central Configuration Module
 ==========================================
 Dual-market bot:
-  US   → Alpaca PAPER (fake USD) + live US market data  [testing]
-  India → Angel One PAPER SIM (fake INR) + live NSE data [testing]
-          Real INR orders only when LIVE_TRADING is armed
+  US   → Alpaca PAPER (fake USD) + live US market data
+  India → Dhan (default) or Angel One — paper sim or live INR
 """
 
 import os
@@ -28,7 +27,7 @@ def _env_int(key: str, default: str) -> int:
 # ===========================================================================
 # Live Trading Safety Gate (India real money ONLY)
 # ===========================================================================
-# Real Angel One CNC orders ONLY when BOTH are set:
+# Real CNC orders ONLY when BOTH are set:
 #   LIVE_TRADING=true
 #   LIVE_CONFIRM=YES_REAL_MONEY
 LIVE_TRADING: bool = _env_bool("LIVE_TRADING", "false")
@@ -38,10 +37,11 @@ LIVE_CONFIRMED: bool = LIVE_TRADING and LIVE_CONFIRM == "YES_REAL_MONEY"
 TEST_MODE: bool = False
 
 # ===========================================================================
-# Market Toggles — both ON for 24/7 dual testing
+# Market Toggles
 # ===========================================================================
-US_ENABLED: bool = _env_bool("US_ENABLED", "true")
-# India paper sim uses LIVE Angel One quotes/candles but places NO real orders.
+# India-first default: US off unless explicitly enabled.
+US_ENABLED: bool = _env_bool("US_ENABLED", "false")
+# India paper sim uses LIVE broker quotes/candles but places NO real orders.
 # Forced OFF automatically when LIVE_CONFIRMED (real money).
 _INDIA_PAPER_ENV: bool = _env_bool("INDIA_PAPER", "true")
 INDIA_PAPER: bool = _INDIA_PAPER_ENV and not LIVE_CONFIRMED
@@ -90,15 +90,48 @@ US_CORRELATION_CLUSTERS: dict[str, list[str]] = {
 }
 
 # ===========================================================================
-# India Market — Angel One (live data; paper sim or real orders)
+# India Market — Dhan (preferred) or Angel One
 # ===========================================================================
+# Broker selector: "dhan" | "angel"
+# If unset: prefer dhan when Dhan client id is present, else angel.
+_INDIA_BROKER_ENV: str = os.getenv("INDIA_BROKER", "").strip().lower()
+
+DHAN_CLIENT_ID: str = os.getenv("DHAN_CLIENT_ID", "").strip()
+DHAN_ACCESS_TOKEN: str = os.getenv("DHAN_ACCESS_TOKEN", "").strip()
+DHAN_PIN: str = os.getenv("DHAN_PIN", "").strip()
+DHAN_TOTP_SECRET: str = os.getenv("DHAN_TOTP_SECRET", "").strip()
+DHAN_API_KEY: str = os.getenv("DHAN_API_KEY", "").strip()
+DHAN_API_SECRET: str = os.getenv("DHAN_API_SECRET", "").strip()
+
+DHAN_CONFIGURED: bool = bool(
+    DHAN_CLIENT_ID
+    and (
+        DHAN_ACCESS_TOKEN
+        or (DHAN_PIN and DHAN_TOTP_SECRET)
+    )
+)
+
 ANGEL_API_KEY: str = os.getenv("ANGEL_API_KEY", "").strip()
 ANGEL_CLIENT_ID: str = os.getenv("ANGEL_CLIENT_ID", "").strip()
 ANGEL_PIN: str = os.getenv("ANGEL_PIN", "").strip()
 ANGEL_TOTP_SECRET: str = os.getenv("ANGEL_TOTP_SECRET", "").strip()
 
-INDIA_ENABLED: bool = bool(
+ANGEL_CONFIGURED: bool = bool(
     ANGEL_API_KEY and ANGEL_CLIENT_ID and ANGEL_PIN and ANGEL_TOTP_SECRET
+)
+
+if _INDIA_BROKER_ENV in ("dhan", "angel"):
+    INDIA_BROKER: str = _INDIA_BROKER_ENV
+elif DHAN_CONFIGURED:
+    INDIA_BROKER = "dhan"
+elif ANGEL_CONFIGURED:
+    INDIA_BROKER = "angel"
+else:
+    INDIA_BROKER = "dhan"
+
+INDIA_ENABLED: bool = (
+    (INDIA_BROKER == "dhan" and DHAN_CONFIGURED)
+    or (INDIA_BROKER == "angel" and ANGEL_CONFIGURED)
 )
 
 INDIA_STOCK_UNIVERSE: list[str] = [

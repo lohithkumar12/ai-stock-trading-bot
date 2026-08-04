@@ -2,9 +2,8 @@
 main.py — Main Orchestrator & Web Admin Dashboard Launcher
 ===========================================================
 24/7 dual-market bot:
-  US    → Alpaca PAPER (fake USD) + live US prices
-  India → Angel One PAPER SIM (fake INR) + live NSE prices
-          (or real INR when LIVE_TRADING is armed)
+  US    → Alpaca PAPER (fake USD) + live US prices (optional)
+  India → Dhan (default) or Angel One — paper sim / live INR
 
 Dashboard tabs: US | India | Combined
 Process stays alive around the clock; trades only during market hours.
@@ -322,7 +321,7 @@ def run_us_loop(data_feed, strategy, risk_mgr, executor, rs_filter=None):
 
 
 def run_india_loop(strategy, risk_mgr, rs_filter=None):
-    from india_broker import get_shared_india_broker
+    from india_client import get_shared_india_broker
 
     logger.info("[INDIA] India Market trading loop starting (24/7 process)...")
 
@@ -542,7 +541,7 @@ def run_bot():
         f"paper={config.PAPER_TRADING} | keys_ok={not config.IS_PLACEHOLDER_KEY}"
     )
     logger.info(
-        f"   India: enabled={config.INDIA_ENABLED} | "
+        f"   India: enabled={config.INDIA_ENABLED} | broker={config.INDIA_BROKER} | "
         f"paper_sim={config.INDIA_PAPER} | live_armed={config.LIVE_CONFIRMED}"
     )
     logger.info(
@@ -553,7 +552,9 @@ def run_bot():
     logger.info("=" * 70)
 
     if not config.INDIA_ENABLED and (not config.US_ENABLED or config.IS_PLACEHOLDER_KEY):
-        logger.critical("No markets configured. Add Alpaca and/or Angel One keys to .env")
+        logger.critical(
+            "No markets configured. Add Dhan (DHAN_*) and/or Alpaca keys to .env"
+        )
         return
 
     if config.LIVE_CONFIRMED:
@@ -603,9 +604,14 @@ def run_bot():
             name="IndiaMarketLoop",
         )
         india_thread.start()
-        logger.info("[INDIA] Background loop started (Angel One + paper/live)")
+        logger.info(
+            f"[INDIA] Background loop started ({config.INDIA_BROKER} + paper/live)"
+        )
     else:
-        logger.warning("[INDIA] Disabled — missing Angel One credentials")
+        logger.warning(
+            "[INDIA] Disabled — missing Dhan/Angel credentials "
+            f"(INDIA_BROKER={config.INDIA_BROKER})"
+        )
 
     logger.info("[MAIN] Process staying alive 24/7 for dashboard + market loops")
     while True:

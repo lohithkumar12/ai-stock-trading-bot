@@ -1,0 +1,957 @@
+"""
+dhan_broker.py — DhanHQ Broker Module
+=======================================
+Wraps Dhan's Python SDK for Indian stock trading (NSE equity).
+
+Handles:
+  - Access-token session (manual token OR PIN+TOTP refresh)
+  - Shared singleton so dashboard + trading loop share one client
+  - Historical hourly candles → pandas DataFrame (cached)
+  - Real-time LTP quotes
+  - CNC order placement / positions / holdings
+  - Paper sim via IndiaPaperPortfolio (live quotes, fake INR)
+
+Env (see config.py):
+  DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN
+  DHAN_PIN + DHAN_TOTP_SECRET  (optional auto-renew)
+  DHAN_API_KEY / DHAN_API_SECRET (stored for OAuth; not required for PIN/TOTP)
+"""
+
+from __future__ import annotations
+
+import logging
+import threading
+import time
+from datetime import datetime, timedelta
+
+import pandas as pd
+import pyotp
+from dhanhq import DhanContext, DhanLogin, dhanhq
+
+import config
+from india_instruments import (
+    INDIA_INSTRUMENTS,
+    get_exchange,
+    get_token,
+)
+from india_paper import IndiaPaperPortfolio
+
+logger = logging.getLogger(__name__)
+
+# Dhan access tokens are typically ~24h; refresh a bit early.
+TOKEN_REFRESH_HOURS = 20
+CANDLE_CACHE_SEC = 30.0
+CANDLE_CALL_GAP_SEC = 0.35
+# Chunk intraday history requests (API can reject very wide ranges).
+INTRADAY_CHUNK_DAYS = 30
+
+_shared_broker: "DhanBroker | None" = None
+_shared_lock = threading.Lock()
+
+
+def get_shared_dhan_broker(auto_login: bool = True) -> "DhanBroker":
+    """Process-wide singleton — bot loop and dashboard must share one session."""
+    global _shared_broker
+    with _shared_lock:
+        if _shared_broker is None:
+            _shared_broker = DhanBroker(auto_login=auto_login)
+        return _shared_broker
+
+
+class DhanBroker:
+    """
+    DhanHQ broker client for NSE equity.
+
+    When config.INDIA_PAPER is True:
+      - Market data comes from LIVE Dhan APIs
+      - Buys/sells update a virtual INR portfolio
+    When LIVE_CONFIRMED:
+      - Real CNC orders hit the Dhan account (static IP whitelist may be required)
+    """
+
+    def __init__(self, auto_login: bool = True):
+        self.client_id = config.DHAN_CLIENT_ID
+        self.access_token = config.DHAN_ACCESS_TOKEN
+        self.pin = config.DHAN_PIN
+        self.totp_secret = config.DHAN_TOTP_SECRET
+        self.api_key = config.DHAN_API_KEY
+        self.api_secret = config.DHAN_API_SECRET
+
+        self.dhan: dhanhq | None = None
+        self._session_time: datetime | None = None
+        self._logged_in = False
+        self.last_error = ""
+        self._last_candle_call_time = 0.0
+        self._candle_cache: dict[str, tuple[float, pd.DataFrame]] = {}
+        self._login_lock = threading.Lock()
+
+        self.paper = IndiaPaperPortfolio() if config.INDIA_PAPER else None
+        mode = "PAPER SIM (live NSE data, fake INR)" if self.paper else "LIVE REAL MONEY"
+        logger.info(f"DhanBroker mode: {mode}")
+
+        if auto_login:
+            self.login()
+
+    # -----------------------------------------------------------------------
+    # Authentication
+    # -----------------------------------------------------------------------
+    def _build_client(self, access_token: str) -> dhanhq:
+        ctx = DhanContext(self.client_id, access_token)
+        return dhanhq(ctx)
+
+    def _totp_now(self) -> str:
+        secret = (self.totp_secret or "").replace(" ", "").upper()
+        return pyotp.TOTP(secret).now()
+
+    def _refresh_access_token(self) -> str | None:
+        """Generate a fresh 24h access token via PIN + TOTP."""
+        if not (self.client_id and self.pin and self.totp_secret):
+            return None
+        try:
+            login = DhanLogin(self.client_id)
+            resp = login.generate_token(self.pin, self._totp_now())
+            token = None
+            if isinstance(resp, dict):
+                token = resp.get("accessToken") or resp.get("access_token")
+                data = resp.get("data")
+                if not token and isinstance(data, dict):
+                    token = data.get("accessToken") or data.get("access_token")
+            if token:
+                logger.info("Dhan access token refreshed via PIN/TOTP")
+                return str(token)
+            self.last_error = f"Dhan token refresh failed: {resp}"
+            logger.error(self.last_error)
+            return None
+        except Exception as e:
+            self.last_error = f"Dhan token refresh error: {e}"
+            logger.error(self.last_error, exc_info=True)
+            return None
+
+    def login(self) -> bool:
+        with self._login_lock:
+            try:
+                if not self.client_id:
+                    self.last_error = "Missing DHAN_CLIENT_ID"
+                    self._logged_in = False
+                    return False
+
+                token = self.access_token
+                need_refresh = not token
+                if self._session_time and token:
+                    age = datetime.now() - self._session_time
+                    if age > timedelta(hours=TOKEN_REFRESH_HOURS):
+                        need_refresh = True
+
+                if need_refresh and self.pin and self.totp_secret:
+                    refreshed = self._refresh_access_token()
+                    if refreshed:
+                        token = refreshed
+                        self.access_token = refreshed
+                    elif not token:
+                        self._logged_in = False
+                        return False
+                elif not token:
+                    self.last_error = (
+                        "Missing DHAN_ACCESS_TOKEN "
+                        "(or set DHAN_PIN + DHAN_TOTP_SECRET to auto-generate)"
+                    )
+                    self._logged_in = False
+                    return False
+
+                self.dhan = self._build_client(token)
+                # Lightweight auth probe
+                funds = self.dhan.get_fund_limits()
+                if isinstance(funds, dict) and funds.get("status") == "failure":
+                    remarks = funds.get("remarks") or funds.get("message") or funds
+                    # Stale token — try one PIN/TOTP refresh
+                    if self.pin and self.totp_secret:
+                        refreshed = self._refresh_access_token()
+                        if refreshed:
+                            self.access_token = refreshed
+                            self.dhan = self._build_client(refreshed)
+                            funds = self.dhan.get_fund_limits()
+                    if isinstance(funds, dict) and funds.get("status") == "failure":
+                        self.last_error = f"Dhan auth failed: {remarks}"
+                        logger.error(self.last_error)
+                        self._logged_in = False
+                        return False
+
+                self._session_time = datetime.now()
+                self._logged_in = True
+                self.last_error = ""
+                logger.info(f"Dhan LOGIN SUCCESS | Client: {self.client_id}")
+                return True
+
+            except Exception as e:
+                self.last_error = f"Dhan login error: {e}"
+                logger.error(self.last_error, exc_info=True)
+                self._logged_in = False
+                return False
+
+    def ensure_session(self) -> None:
+        if not self._logged_in or self.dhan is None:
+            self.login()
+            return
+        if self._session_time:
+            elapsed = datetime.now() - self._session_time
+            if elapsed > timedelta(hours=TOKEN_REFRESH_HOURS):
+                logger.info("Dhan token nearing expiry — refreshing...")
+                self.login()
+
+    def _handle_api_error(self, context: str, err) -> bool:
+        msg = str(err).lower()
+        if any(
+            k in msg
+            for k in ("token", "unauthorized", "401", "auth", "expired", "invalid")
+        ):
+            logger.warning(f"{context}: session issue — re-login")
+            self._logged_in = False
+            return self.login()
+        return False
+
+    @property
+    def is_logged_in(self) -> bool:
+        return self._logged_in
+
+    # -----------------------------------------------------------------------
+    # Helpers
+    # -----------------------------------------------------------------------
+    def _security_id(self, symbol: str) -> str | None:
+        # NSE instrument tokens match our Angel map (e.g. HDFCBANK=1333).
+        return get_token(symbol)
+
+    def _exchange_segment(self, symbol: str) -> str:
+        ex = get_exchange(symbol)
+        return "NSE_EQ" if ex.upper() == "NSE" else "BSE_EQ"
+
+    def _ok(self, resp) -> bool:
+        if not isinstance(resp, dict):
+            return False
+        status = resp.get("status")
+        return status in (True, "success", "Success", "SUCCESS")
+
+    def _data(self, resp):
+        if not isinstance(resp, dict):
+            return None
+        return resp.get("data")
+
+    # -----------------------------------------------------------------------
+    # Account
+    # -----------------------------------------------------------------------
+    def get_account_info(self) -> dict | None:
+        if self.paper is not None:
+            marks = self._live_marks_for_positions(self.paper.positions.keys())
+            info = self.paper.get_account_info(marks)
+            logger.info(
+                f"Dhan PAPER | Equity=Rs {info['equity']:,.2f} | "
+                f"Cash=Rs {info['available_cash']:,.2f}"
+            )
+            return info
+
+        self.ensure_session()
+        if not self.dhan:
+            return None
+        try:
+            resp = self.dhan.get_fund_limits()
+            data = self._data(resp) if self._ok(resp) else None
+            if not isinstance(data, dict):
+                self.last_error = f"Fund limits error: {resp}"
+                logger.error(self.last_error)
+                return None
+
+            available_cash = float(
+                data.get("availabelBalance")
+                or data.get("availableBalance")
+                or data.get("sodLimit")
+                or 0
+            )
+            used_margin = float(data.get("utilizedAmount") or data.get("usedMargin") or 0)
+            net = float(
+                data.get("availabelBalance")
+                or data.get("availableBalance")
+                or data.get("withdrawableBalance")
+                or available_cash
+            )
+            info = {
+                "equity": net if net > 0 else available_cash,
+                "available_cash": available_cash,
+                "used_margin": used_margin,
+                "net": net,
+                "paper": False,
+            }
+            logger.info(
+                f"Dhan LIVE | Net={net:,.2f} | Cash={available_cash:,.2f} | "
+                f"Used={used_margin:,.2f}"
+            )
+            return info
+        except Exception as e:
+            if self._handle_api_error("fund limits", e):
+                return self.get_account_info()
+            self.last_error = f"Fund limits error: {e}"
+            logger.error(self.last_error, exc_info=True)
+            return None
+
+    def _live_marks_for_positions(self, symbols) -> dict[str, float]:
+        marks = {}
+        for symbol in symbols:
+            quote = self.get_latest_quote(symbol)
+            if quote and quote.get("ltp"):
+                marks[symbol] = float(quote["ltp"])
+        return marks
+
+    # -----------------------------------------------------------------------
+    # Historical bars
+    # -----------------------------------------------------------------------
+    def _throttle_candles(self) -> None:
+        now_ts = time.time()
+        gap = now_ts - self._last_candle_call_time
+        if gap < CANDLE_CALL_GAP_SEC:
+            time.sleep(CANDLE_CALL_GAP_SEC - gap)
+        self._last_candle_call_time = time.time()
+
+    def _parse_intraday(self, data) -> pd.DataFrame | None:
+        if not data:
+            return None
+        if isinstance(data, dict) and "open" in data and "timestamp" in data:
+            ts = data["timestamp"]
+            if self.dhan:
+                try:
+                    ts = [self.dhan.convert_to_date_time(t) for t in ts]
+                except Exception:
+                    ts = pd.to_datetime(ts, unit="s", errors="coerce")
+            df = pd.DataFrame(
+                {
+                    "open": data.get("open"),
+                    "high": data.get("high"),
+                    "low": data.get("low"),
+                    "close": data.get("close"),
+                    "volume": data.get("volume") or [0] * len(data["open"]),
+                },
+                index=pd.to_datetime(ts),
+            )
+            return df.astype(float).sort_index()
+        if isinstance(data, list) and data:
+            # Fallback row format
+            rows = []
+            for row in data:
+                if isinstance(row, dict):
+                    rows.append(row)
+                elif isinstance(row, (list, tuple)) and len(row) >= 5:
+                    rows.append(
+                        {
+                            "timestamp": row[0],
+                            "open": row[1],
+                            "high": row[2],
+                            "low": row[3],
+                            "close": row[4],
+                            "volume": row[5] if len(row) > 5 else 0,
+                        }
+                    )
+            if not rows:
+                return None
+            df = pd.DataFrame(rows)
+            if "timestamp" in df.columns:
+                df["timestamp"] = pd.to_datetime(df["timestamp"])
+                df.set_index("timestamp", inplace=True)
+            return df[["open", "high", "low", "close", "volume"]].astype(float).sort_index()
+        return None
+
+    def get_historical_bars(self, symbol: str, days: int = 300) -> pd.DataFrame | None:
+        self.ensure_session()
+        if not self.dhan:
+            return None
+
+        sec_id = self._security_id(symbol)
+        if not sec_id:
+            logger.error(f"No security_id for {symbol}")
+            return None
+
+        now_ts = time.time()
+        if symbol in self._candle_cache:
+            cache_time, cached_df = self._candle_cache[symbol]
+            if now_ts - cache_time < CANDLE_CACHE_SEC:
+                return cached_df
+
+        segment = self._exchange_segment(symbol)
+        to_date = datetime.now()
+        from_date = to_date - timedelta(days=days)
+        frames: list[pd.DataFrame] = []
+
+        chunk_start = from_date
+        try:
+            while chunk_start < to_date:
+                chunk_end = min(chunk_start + timedelta(days=INTRADAY_CHUNK_DAYS), to_date)
+                self._throttle_candles()
+                resp = self.dhan.intraday_minute_data(
+                    security_id=str(sec_id),
+                    exchange_segment=segment,
+                    instrument_type="EQUITY",
+                    from_date=chunk_start.strftime("%Y-%m-%d %H:%M:%S"),
+                    to_date=chunk_end.strftime("%Y-%m-%d %H:%M:%S"),
+                    interval=60,
+                )
+                if self._ok(resp):
+                    part = self._parse_intraday(self._data(resp))
+                    if part is not None and not part.empty:
+                        frames.append(part)
+                else:
+                    logger.debug(f"{symbol}: intraday chunk miss: {resp}")
+                chunk_start = chunk_end
+
+            if not frames:
+                logger.warning(f"{symbol}: No Dhan candle data")
+                if symbol in self._candle_cache:
+                    return self._candle_cache[symbol][1]
+                return None
+
+            df = pd.concat(frames).sort_index()
+            df = df[~df.index.duplicated(keep="last")]
+            self._candle_cache[symbol] = (time.time(), df)
+            logger.debug(f"{symbol}: Fetched {len(df)} hourly bars from Dhan")
+            return df
+
+        except Exception as e:
+            if self._handle_api_error(f"{symbol} candles", e):
+                return self.get_historical_bars(symbol, days=days)
+            logger.error(f"{symbol}: Dhan historical error: {e}", exc_info=True)
+            if symbol in self._candle_cache:
+                return self._candle_cache[symbol][1]
+            return None
+
+    # -----------------------------------------------------------------------
+    # Quotes
+    # -----------------------------------------------------------------------
+    def get_latest_quote(self, symbol: str) -> dict | None:
+        self.ensure_session()
+        if not self.dhan:
+            return None
+
+        sec_id = self._security_id(symbol)
+        if not sec_id:
+            logger.error(f"No security_id for {symbol}")
+            return None
+
+        segment = self._exchange_segment(symbol)
+        try:
+            resp = self.dhan.ohlc_data({segment: [int(sec_id)]})
+            if not self._ok(resp):
+                # Fallback to full quote packet
+                resp = self.dhan.quote_data({segment: [int(sec_id)]})
+            data = self._data(resp)
+            ltp = None
+            if isinstance(data, dict):
+                # Nested: {NSE_EQ: {sec_id: {...}}}
+                bucket = data.get(segment) or data.get(str(sec_id)) or data
+                if isinstance(bucket, dict):
+                    node = bucket.get(str(sec_id)) or bucket.get(int(sec_id)) or bucket
+                    if isinstance(node, dict):
+                        ltp = (
+                            node.get("last_price")
+                            or node.get("LTP")
+                            or node.get("ltp")
+                            or (node.get("ohlc") or {}).get("close")
+                        )
+                        if ltp is None and "average_price" in node:
+                            ltp = node.get("average_price")
+            if ltp is None:
+                logger.warning(f"{symbol}: LTP parse failed — {resp}")
+                return None
+
+            return {
+                "ltp": float(ltp),
+                "ask_price": float(ltp),
+                "symbol": symbol,
+                "exchange": get_exchange(symbol),
+            }
+        except Exception as e:
+            if self._handle_api_error(f"{symbol} LTP", e):
+                return self.get_latest_quote(symbol)
+            logger.error(f"{symbol}: LTP error: {e}", exc_info=True)
+            return None
+
+    # -----------------------------------------------------------------------
+    # Live gate
+    # -----------------------------------------------------------------------
+    def _assert_live_allowed(self, action: str) -> bool:
+        if self.paper is not None:
+            return True
+        if not config.LIVE_CONFIRMED:
+            logger.critical(
+                f"BLOCKED {action}: Live trading is OFF. "
+                f"Keep INDIA_PAPER=true for testing, or set "
+                f"LIVE_TRADING=true and LIVE_CONFIRM=YES_REAL_MONEY for real money."
+            )
+            self.last_error = "Live trading not confirmed"
+            return False
+        return True
+
+    @staticmethod
+    def _extract_order_id(result) -> str | None:
+        if result is None:
+            return None
+        if isinstance(result, str) and result.strip():
+            return result.strip()
+        if isinstance(result, dict):
+            if result.get("status") in (False, "failure", "Failure"):
+                return None
+            data = result.get("data")
+            if isinstance(data, dict):
+                oid = (
+                    data.get("orderId")
+                    or data.get("order_id")
+                    or data.get("orderid")
+                )
+                if oid:
+                    return str(oid)
+            oid = result.get("orderId") or result.get("order_id")
+            if oid:
+                return str(oid)
+        return None
+
+    # -----------------------------------------------------------------------
+    # Positions
+    # -----------------------------------------------------------------------
+    def get_open_positions(self) -> dict:
+        if self.paper is not None:
+            marks = self._live_marks_for_positions(self.paper.positions.keys())
+            pos_dict = self.paper.get_open_positions(marks)
+            if pos_dict:
+                logger.info(f"India PAPER positions: {list(pos_dict.keys())}")
+            return pos_dict
+
+        self.ensure_session()
+        if not self.dhan:
+            return {}
+
+        pos_dict: dict = {}
+        token_to_symbol = {
+            info["token"]: sym for sym, info in INDIA_INSTRUMENTS.items()
+        }
+
+        try:
+            resp = self.dhan.get_positions()
+            data = self._data(resp) if self._ok(resp) else None
+            for pos in data or []:
+                if not isinstance(pos, dict):
+                    continue
+                net_qty = int(
+                    float(
+                        pos.get("netQty")
+                        or pos.get("net_qty")
+                        or pos.get("quantity")
+                        or 0
+                    )
+                )
+                if net_qty == 0:
+                    continue
+                sec_id = str(pos.get("securityId") or pos.get("security_id") or "")
+                trading_symbol = (
+                    pos.get("tradingSymbol")
+                    or pos.get("trading_symbol")
+                    or pos.get("symbol")
+                    or ""
+                )
+                symbol = token_to_symbol.get(sec_id) or str(trading_symbol).replace(
+                    "-EQ", ""
+                )
+                buy_price = float(
+                    pos.get("avgCostPrice")
+                    or pos.get("averagePrice")
+                    or pos.get("buyAvg")
+                    or 0
+                )
+                ltp = float(pos.get("ltp") or pos.get("lastTradedPrice") or 0)
+                pnl = float(pos.get("unrealizedProfit") or pos.get("pnl") or 0)
+                pnl_pct = ((ltp - buy_price) / buy_price) if buy_price > 0 else 0
+                pos_dict[symbol] = {
+                    "qty": abs(net_qty),
+                    "avg_entry_price": buy_price,
+                    "current_price": ltp,
+                    "market_value": abs(net_qty) * ltp,
+                    "unrealized_pl": pnl,
+                    "unrealized_plpc": pnl_pct,
+                    "trading_symbol": trading_symbol,
+                    "token": sec_id,
+                    "source": "position",
+                }
+        except Exception as e:
+            logger.error(f"Dhan positions error: {e}", exc_info=True)
+
+        try:
+            resp = self.dhan.get_holdings()
+            data = self._data(resp) if self._ok(resp) else None
+            for h in data or []:
+                if not isinstance(h, dict):
+                    continue
+                qty = int(float(h.get("availableQty") or h.get("totalQty") or h.get("quantity") or 0))
+                if qty <= 0:
+                    continue
+                sec_id = str(h.get("securityId") or h.get("security_id") or "")
+                trading_symbol = (
+                    h.get("tradingSymbol")
+                    or h.get("trading_symbol")
+                    or h.get("symbol")
+                    or ""
+                )
+                symbol = token_to_symbol.get(sec_id) or str(trading_symbol).replace(
+                    "-EQ", ""
+                )
+                if symbol in pos_dict:
+                    continue
+                buy_price = float(h.get("avgCostPrice") or h.get("averagePrice") or 0)
+                ltp = float(h.get("ltp") or h.get("lastTradedPrice") or 0)
+                pnl = float(h.get("unrealizedProfit") or h.get("pnl") or 0)
+                if buy_price <= 0 and ltp > 0:
+                    buy_price = ltp
+                pnl_pct = ((ltp - buy_price) / buy_price) if buy_price > 0 else 0
+                pos_dict[symbol] = {
+                    "qty": qty,
+                    "avg_entry_price": buy_price,
+                    "current_price": ltp,
+                    "market_value": qty * ltp,
+                    "unrealized_pl": pnl,
+                    "unrealized_plpc": pnl_pct,
+                    "trading_symbol": trading_symbol,
+                    "token": sec_id,
+                    "source": "holding",
+                }
+        except Exception as e:
+            logger.warning(f"Dhan holdings fetch warning: {e}")
+
+        if pos_dict:
+            logger.info(f"India positions/holdings: {list(pos_dict.keys())}")
+        return pos_dict
+
+    # -----------------------------------------------------------------------
+    # Orders
+    # -----------------------------------------------------------------------
+    def place_buy_order(
+        self,
+        symbol: str,
+        qty: int,
+        limit_price: float,
+        place_stoploss: bool = True,
+        stop_loss_pct: float | None = None,
+        stop_loss_price: float | None = None,
+        take_profit_price: float | None = None,
+        atr: float | None = None,
+    ) -> str | None:
+        if not self._assert_live_allowed(f"BUY {symbol}"):
+            return None
+        if qty <= 0 or limit_price <= 0:
+            logger.error(f"Invalid buy params for {symbol}: qty={qty} price={limit_price}")
+            return None
+
+        if stop_loss_price is None:
+            sl_pct = stop_loss_pct if stop_loss_pct is not None else config.STOP_LOSS_PCT
+            stop_loss_price = round(limit_price * (1 - sl_pct), 2)
+
+        if self.paper is not None:
+            quote = self.get_latest_quote(symbol)
+            fill = float(quote["ltp"]) if quote else float(limit_price)
+            return self.paper.buy(
+                symbol,
+                qty,
+                fill,
+                stop_loss=stop_loss_price,
+                take_profit=take_profit_price,
+                atr=atr,
+            )
+
+        self.ensure_session()
+        if not self.dhan:
+            return None
+        sec_id = self._security_id(symbol)
+        if not sec_id:
+            logger.error(f"Cannot place order — no security_id for {symbol}")
+            return None
+
+        try:
+            entry_price = round(limit_price * 1.001, 2)
+            raw = self.dhan.place_order(
+                security_id=str(sec_id),
+                exchange_segment=self._exchange_segment(symbol),
+                transaction_type=dhanhq.BUY,
+                quantity=int(qty),
+                order_type=dhanhq.LIMIT,
+                product_type=dhanhq.CNC,
+                price=float(entry_price),
+                trigger_price=0,
+                validity=dhanhq.DAY,
+                tag=f"BOT-BUY-{symbol}"[:20],
+            )
+            order_id = self._extract_order_id(raw)
+            if not order_id:
+                logger.error(f"BUY rejected for {symbol}: {raw}")
+                self.last_error = f"Buy rejected: {raw}"
+                return None
+
+            logger.warning(
+                f"LIVE BUY ORDER (Dhan) | {symbol} | Qty={qty} | "
+                f"Limit={entry_price:.2f} | Order ID={order_id}"
+            )
+            if place_stoploss and stop_loss_price:
+                self.place_stoploss_order(symbol, qty, stop_loss_price)
+            return order_id
+        except Exception as e:
+            if self._handle_api_error(f"BUY {symbol}", e) and not getattr(
+                self, "_buy_retrying", False
+            ):
+                self._buy_retrying = True
+                try:
+                    return self.place_buy_order(
+                        symbol,
+                        qty,
+                        limit_price,
+                        place_stoploss=place_stoploss,
+                        stop_loss_price=stop_loss_price,
+                        take_profit_price=take_profit_price,
+                        atr=atr,
+                    )
+                finally:
+                    self._buy_retrying = False
+            logger.error(f"Failed to place BUY for {symbol}: {e}", exc_info=True)
+            return None
+
+    def place_stoploss_order(
+        self,
+        symbol: str,
+        qty: int,
+        trigger_price: float,
+    ) -> str | None:
+        if self.paper is not None:
+            logger.info(f"[PAPER] Soft stop-loss armed for {symbol} @ {trigger_price:.2f}")
+            return f"PAPER-SL-{symbol}"
+
+        if not self._assert_live_allowed(f"SL {symbol}"):
+            return None
+
+        self.ensure_session()
+        if not self.dhan:
+            return None
+        sec_id = self._security_id(symbol)
+        if not sec_id or qty <= 0 or trigger_price <= 0:
+            return None
+
+        try:
+            limit_price = round(trigger_price * 0.995, 2)
+            raw = self.dhan.place_order(
+                security_id=str(sec_id),
+                exchange_segment=self._exchange_segment(symbol),
+                transaction_type=dhanhq.SELL,
+                quantity=int(qty),
+                order_type=dhanhq.SL,
+                product_type=dhanhq.CNC,
+                price=float(limit_price),
+                trigger_price=float(round(trigger_price, 2)),
+                validity=dhanhq.DAY,
+                tag=f"BOT-SL-{symbol}"[:20],
+            )
+            order_id = self._extract_order_id(raw)
+            if order_id:
+                logger.warning(
+                    f"LIVE STOP-LOSS (Dhan) | {symbol} | Qty={qty} | "
+                    f"Trigger={trigger_price:.2f} | Order ID={order_id}"
+                )
+            else:
+                logger.error(f"Stop-loss not accepted for {symbol}: {raw}")
+            return order_id
+        except Exception as e:
+            logger.error(f"Failed to place stop-loss for {symbol}: {e}", exc_info=True)
+            return None
+
+    def place_sell_order(
+        self,
+        symbol: str,
+        qty: int,
+        limit_price: float = 0,
+        order_type: str = "MARKET",
+    ) -> str | None:
+        if not self._assert_live_allowed(f"SELL {symbol}"):
+            return None
+
+        if self.paper is not None:
+            quote = self.get_latest_quote(symbol)
+            fill = float(quote["ltp"]) if quote else float(limit_price or 0)
+            if fill <= 0:
+                logger.error(f"[PAPER] No LTP to sell {symbol}")
+                return None
+            return self.paper.sell(symbol, qty, fill)
+
+        self.ensure_session()
+        if not self.dhan:
+            return None
+        sec_id = self._security_id(symbol)
+        if not sec_id:
+            logger.error(f"Cannot place sell — no security_id for {symbol}")
+            return None
+
+        try:
+            dhan_order_type = dhanhq.MARKET
+            price = 0.0
+            if order_type == "MARKET" and limit_price <= 0:
+                quote = self.get_latest_quote(symbol)
+                if quote:
+                    price = round(quote["ltp"] * 0.995, 2)
+                    dhan_order_type = dhanhq.LIMIT
+                else:
+                    dhan_order_type = dhanhq.MARKET
+                    price = 0.0
+            elif order_type == "LIMIT" or limit_price > 0:
+                dhan_order_type = dhanhq.LIMIT
+                price = float(round(limit_price, 2))
+                if price <= 0:
+                    logger.error(f"Sell needs a limit price for {symbol}")
+                    return None
+
+            raw = self.dhan.place_order(
+                security_id=str(sec_id),
+                exchange_segment=self._exchange_segment(symbol),
+                transaction_type=dhanhq.SELL,
+                quantity=int(qty),
+                order_type=dhan_order_type,
+                product_type=dhanhq.CNC,
+                price=float(price),
+                trigger_price=0,
+                validity=dhanhq.DAY,
+                tag=f"BOT-SELL-{symbol}"[:20],
+            )
+            order_id = self._extract_order_id(raw)
+            if not order_id:
+                logger.error(f"SELL rejected for {symbol}: {raw}")
+                return None
+            logger.warning(
+                f"LIVE SELL ORDER (Dhan) | {symbol} | Qty={qty} | Order ID={order_id}"
+            )
+            return order_id
+        except Exception as e:
+            logger.error(f"Failed to place SELL for {symbol}: {e}", exc_info=True)
+            return None
+
+    def close_position(self, symbol: str) -> bool:
+        positions = self.get_open_positions()
+        if symbol not in positions:
+            logger.warning(f"{symbol}: No open position to close")
+            return False
+        qty = positions[symbol]["qty"]
+        order_id = self.place_sell_order(symbol, qty, order_type="MARKET")
+        if order_id:
+            logger.info(f"Position CLOSED for {symbol} (Qty={qty})")
+            return True
+        return False
+
+    def check_sl_tp(self, risk_mgr) -> list[str]:
+        closed_symbols = []
+        positions = self.get_open_positions()
+
+        for symbol, pos in positions.items():
+            entry_price = float(pos["avg_entry_price"])
+            current_price = float(pos["current_price"])
+            atr = pos.get("atr")
+            if atr is not None:
+                try:
+                    atr = float(atr)
+                except (TypeError, ValueError):
+                    atr = None
+
+            stored_sl = pos.get("stop_loss")
+            stored_tp = pos.get("take_profit")
+
+            if stored_sl is not None:
+                sl_price = float(stored_sl)
+            else:
+                sl_price = risk_mgr.get_stop_loss_price(entry_price, atr)
+
+            if stored_tp is not None:
+                tp_price = float(stored_tp)
+            else:
+                tp_price = risk_mgr.get_take_profit_price(
+                    entry_price, stop_loss_price=sl_price, atr=atr
+                )
+
+            if symbol not in getattr(risk_mgr, "_trade_meta", {}):
+                risk_mgr.register_trade(symbol, entry_price, sl_price, atr)
+
+            trailed = risk_mgr.update_trailing_stop(symbol, current_price, atr)
+            if trailed is not None and trailed > sl_price:
+                sl_price = trailed
+                if self.paper is not None:
+                    self.paper.update_position_meta(
+                        symbol,
+                        stop_loss=sl_price,
+                        peak_price=max(
+                            float(pos.get("peak_price") or entry_price),
+                            current_price,
+                        ),
+                    )
+
+            reason = None
+            if current_price <= sl_price:
+                reason = "stop_loss"
+                logger.warning(
+                    f"[INDIA SL] {symbol} hit stop! "
+                    f"Entry={entry_price:.2f} Px={current_price:.2f} SL={sl_price:.2f}"
+                )
+            elif current_price >= tp_price:
+                reason = "take_profit"
+                logger.info(
+                    f"[INDIA TP] {symbol} hit target! "
+                    f"Entry={entry_price:.2f} Px={current_price:.2f} TP={tp_price:.2f}"
+                )
+
+            if reason and self.close_position(symbol):
+                closed_symbols.append(symbol)
+                risk_mgr.clear_trade(symbol)
+                try:
+                    import trade_journal
+
+                    trade_journal.record_exit(
+                        "INDIA", symbol, current_price, reason=reason
+                    )
+                except Exception as je:
+                    logger.debug(f"Journal exit skip: {je}")
+
+        return closed_symbols
+
+    def cancel_all_open_orders(self) -> bool:
+        if self.paper is not None:
+            logger.info("[PAPER] No broker orders to cancel")
+            return True
+
+        self.ensure_session()
+        if not self.dhan:
+            return False
+        try:
+            resp = self.dhan.get_order_list()
+            data = self._data(resp) if self._ok(resp) else None
+            if not data:
+                return True
+            cancelled = 0
+            for order in data:
+                if not isinstance(order, dict):
+                    continue
+                status = str(
+                    order.get("orderStatus") or order.get("status") or ""
+                ).upper()
+                if status not in (
+                    "PENDING",
+                    "TRANSIT",
+                    "OPEN",
+                    "TRIGGER_PENDING",
+                    "PART_TRADED",
+                ):
+                    continue
+                oid = order.get("orderId") or order.get("order_id")
+                if not oid:
+                    continue
+                try:
+                    self.dhan.cancel_order(str(oid))
+                    cancelled += 1
+                except Exception as ce:
+                    logger.warning(f"Cancel order {oid} failed: {ce}")
+            if cancelled:
+                logger.info(f"Cancelled {cancelled} open Dhan order(s)")
+            return True
+        except Exception as e:
+            logger.error(f"Dhan cancel orders error: {e}", exc_info=True)
+            return False
