@@ -1,8 +1,7 @@
 /* ==========================================================================
-   AI Quant Trading Dashboard — Frontend Logic (US + India Markets)
+   AI Quant Trading Dashboard — Frontend Logic (India Market)
    ========================================================================== */
 
-let currentTab = 'us'; // 'us' | 'india'
 let liveGeneration = 0;
 let scannerGeneration = 0;
 let liveAbort = null;
@@ -43,34 +42,7 @@ function beginScannerFetch() {
     return { gen: scannerGeneration, signal: scannerAbort.signal };
 }
 
-function switchMarketTab(tab) {
-    if (tab === currentTab) return;
-    currentTab = tab;
-
-    document.querySelectorAll('.tab-btn').forEach(btn => btn.classList.remove('active'));
-    document.getElementById(`tab-${tab}`).classList.add('active');
-
-    const universeSub = document.getElementById("kpi-universe-sub");
-    const scannerTitle = document.getElementById("scanner-title");
-    const positionsTitle = document.getElementById("positions-title");
-
-    if (tab === 'us') {
-        universeSub.textContent = "Universe: US Large-Caps (Alpaca)";
-        scannerTitle.innerHTML = '<i class="fa-solid fa-radar"></i> US Strategy Scanner';
-        positionsTitle.innerHTML = '<i class="fa-solid fa-list-check"></i> US Open Positions';
-    } else {
-        universeSub.textContent = "Universe: Nifty Large-Caps (Dhan / NSE)";
-        scannerTitle.innerHTML = '<i class="fa-solid fa-radar"></i> India Strategy Scanner (NSE)';
-        positionsTitle.innerHTML = '<i class="fa-solid fa-list-check"></i> India Open Positions';
-    }
-
-    clearMarketPanels(tab);
-    fetchLiveData();
-    fetchScannerData();
-    fetchTrades();
-}
-
-function clearMarketPanels(tab) {
+function clearMarketPanels() {
     document.getElementById("equity-val").textContent = "—";
     document.getElementById("equity-sub").textContent = "Loading…";
     document.getElementById("daily-pl-val").textContent = "—";
@@ -85,27 +57,19 @@ function clearMarketPanels(tab) {
     document.getElementById("last-updated").textContent = "Updating…";
 
     document.getElementById("positions-tbody").innerHTML =
-        `<tr><td colspan="9" class="empty-state"><i class="fa-solid fa-spinner fa-spin"></i> Loading ${tab.toUpperCase()} positions…</td></tr>`;
+        `<tr><td colspan="9" class="empty-state"><i class="fa-solid fa-spinner fa-spin"></i> Loading positions…</td></tr>`;
     document.getElementById("scanner-container").innerHTML =
-        `<div class="loading-state"><i class="fa-solid fa-spinner fa-spin"></i> Loading ${tab.toUpperCase()} scanner…</div>`;
+        `<div class="loading-state"><i class="fa-solid fa-spinner fa-spin"></i> Loading scanner…</div>`;
 }
 
 function fetchLiveData() {
     const { gen, signal } = beginLiveFetch();
-    if (currentTab === 'us') {
-        fetchUSLive(gen, signal);
-    } else {
-        fetchIndiaLive(gen, signal);
-    }
+    fetchLive(gen, signal);
 }
 
 function fetchScannerData() {
     const { gen, signal } = beginScannerFetch();
-    if (currentTab === 'us') {
-        fetchUSScanner(gen, signal);
-    } else {
-        fetchIndiaScanner(gen, signal);
-    }
+    fetchScanner(gen, signal);
 }
 
 function fetchCurrentTabData() {
@@ -113,7 +77,7 @@ function fetchCurrentTabData() {
     fetchScannerData();
 }
 
-async function fetchUSLive(gen, signal) {
+async function fetchLive(gen, signal) {
     try {
         const [statusRes, positionsRes] = await Promise.all([
             fetch('/api/status', { signal }),
@@ -124,49 +88,11 @@ async function fetchUSLive(gen, signal) {
         if (statusRes.ok) {
             const status = await statusRes.json();
             if (isLiveStale(gen)) return;
-            updateStatusUI(status, formatUSD);
-        }
-
-        if (positionsRes.ok) {
-            const positions = await positionsRes.json();
-            if (isLiveStale(gen)) return;
-            updatePositionsUI(positions, formatUSD, 'closePosition');
-        }
-    } catch (err) {
-        if (err.name === 'AbortError' || isLiveStale(gen)) return;
-        console.error("Error fetching US live data:", err);
-    }
-}
-
-async function fetchUSScanner(gen, signal) {
-    try {
-        const scannerRes = await fetch('/api/scanner', { signal });
-        if (isScannerStale(gen) || !scannerRes.ok) return;
-        const scanner = await scannerRes.json();
-        if (isScannerStale(gen)) return;
-        updateScannerUI(scanner, formatUSD);
-    } catch (err) {
-        if (err.name === 'AbortError' || isScannerStale(gen)) return;
-        console.error("Error fetching US scanner:", err);
-    }
-}
-
-async function fetchIndiaLive(gen, signal) {
-    try {
-        const [statusRes, positionsRes] = await Promise.all([
-            fetch('/api/india/status', { signal }),
-            fetch('/api/india/positions', { signal })
-        ]);
-        if (isLiveStale(gen)) return;
-
-        if (statusRes.ok) {
-            const status = await statusRes.json();
-            if (isLiveStale(gen)) return;
             if (status.status === "disabled" || status.status === "error") {
                 renderIndiaDisabledState(status.message);
                 return;
             }
-            updateIndiaStatusUI(status);
+            updateStatusUI(status);
         } else {
             renderIndiaDisabledState("Add Dhan keys in environment");
         }
@@ -174,25 +100,25 @@ async function fetchIndiaLive(gen, signal) {
         if (positionsRes.ok) {
             const positions = await positionsRes.json();
             if (isLiveStale(gen)) return;
-            updatePositionsUI(positions, formatINR, 'closeIndiaPosition');
+            updatePositionsUI(positions, formatINR, 'closePosition');
         }
     } catch (err) {
         if (err.name === 'AbortError' || isLiveStale(gen)) return;
-        console.error("Error fetching India live data:", err);
+        console.error("Error fetching live data:", err);
         renderIndiaDisabledState("Add Dhan keys in environment");
     }
 }
 
-async function fetchIndiaScanner(gen, signal) {
+async function fetchScanner(gen, signal) {
     try {
-        const scannerRes = await fetch('/api/india/scanner', { signal });
+        const scannerRes = await fetch('/api/scanner', { signal });
         if (isScannerStale(gen) || !scannerRes.ok) return;
         const scanner = await scannerRes.json();
         if (isScannerStale(gen)) return;
         updateScannerUI(scanner, formatINR);
     } catch (err) {
         if (err.name === 'AbortError' || isScannerStale(gen)) return;
-        console.error("Error fetching India scanner:", err);
+        console.error("Error fetching scanner:", err);
     }
 }
 
@@ -215,57 +141,9 @@ function updateKillSwitchBadge(active) {
     }
 }
 
-function updateStatusUI(data, formatter) {
-    if (!data || data.status === "error") return;
 
-    document.getElementById("equity-val").textContent = formatter(data.equity);
-    document.getElementById("equity-sub").textContent = `Prev: ${formatter(data.last_equity)}`;
 
-    const dailyPlEl = document.getElementById("daily-pl-val");
-    const dailyPctEl = document.getElementById("daily-pl-pct");
-    const plIconBg = document.getElementById("pl-icon-bg");
-    const plIcon = document.getElementById("pl-icon");
-
-    dailyPlEl.textContent = `${data.daily_pl >= 0 ? '+' : ''}${formatter(data.daily_pl)}`;
-    dailyPctEl.textContent = `${data.daily_pl_pct >= 0 ? '+' : ''}${data.daily_pl_pct.toFixed(2)}%`;
-
-    if (data.daily_pl >= 0) {
-        dailyPlEl.style.color = "var(--success)";
-        dailyPctEl.className = "kpi-badge positive";
-        plIconBg.className = "kpi-icon green";
-        plIcon.className = "fa-solid fa-chart-line";
-    } else {
-        dailyPlEl.style.color = "var(--danger)";
-        dailyPctEl.className = "kpi-badge negative";
-        plIconBg.className = "kpi-icon red";
-        plIcon.className = "fa-solid fa-chart-line-down";
-    }
-
-    document.getElementById("buying-power-val").textContent = formatter(data.buying_power);
-    document.getElementById("cash-val").textContent = `Cash: ${formatter(data.cash)}`;
-
-    const modeText = document.getElementById("mode-text");
-    if (modeText) {
-        modeText.textContent = data.paper_trading ? "US Paper (live prices)" : "US LIVE MONEY";
-    }
-
-    const marketStatusEl = document.getElementById("market-status");
-    const marketBadge = document.getElementById("market-badge");
-    if (data.market_open) {
-        marketStatusEl.textContent = "US Market Open";
-        marketBadge.style.color = "var(--success)";
-        marketBadge.style.background = "var(--success-bg)";
-    } else {
-        marketStatusEl.textContent = "US Market Closed";
-        marketBadge.style.color = "var(--warning)";
-        marketBadge.style.background = "var(--warning-bg)";
-    }
-
-    updateKillSwitchBadge(!!data.kill_switch_active);
-    document.getElementById("last-updated").textContent = `Updated: ${data.timestamp.split(' ')[1]}`;
-}
-
-function updateIndiaStatusUI(data) {
+function updateStatusUI(data) {
     if (!data || data.status === "error") return;
 
     document.getElementById("equity-val").textContent = formatINR(data.equity);
@@ -427,8 +305,7 @@ async function fetchTrades() {
     const tbody = document.getElementById("trades-tbody");
     if (!tbody) return;
     try {
-        const market = currentTab === 'india' ? 'INDIA' : 'US';
-        const res = await fetch(`/api/trades?market=${market}&limit=20`);
+        const res = await fetch(`/api/trades?limit=20`);
         if (!res.ok) return;
         const trades = await res.json();
         if (!trades.length) {
@@ -459,10 +336,9 @@ async function fetchHealth() {
         const res = await fetch('/api/health');
         if (!res.ok) return;
         const h = await res.json();
-        const usAge = h.us_cycle_age_sec != null ? `${Math.round(h.us_cycle_age_sec)}s` : '—';
         const inAge = h.india_cycle_age_sec != null ? `${Math.round(h.india_cycle_age_sec)}s` : '—';
-        el.textContent = `US cycle ${usAge} | IN cycle ${inAge} | 429s ${h.alpaca_429_count || 0}`;
-        if (h.us_last_error || h.india_last_error) {
+        el.textContent = `IN cycle ${inAge} | 429s ${h.alpaca_429_count || 0}`;
+        if (h.india_last_error) {
             el.textContent += ' | err';
             el.style.color = 'var(--warning)';
         } else {
@@ -474,7 +350,7 @@ async function fetchHealth() {
 }
 
 async function closePosition(symbol) {
-    if (!confirm(`Close US position for ${symbol}?`)) return;
+    if (!confirm(`Close position for ${symbol}?`)) return;
     try {
         const res = await fetch(`/api/close_position/${symbol}`, { method: 'POST' });
         const data = await res.json();
@@ -485,17 +361,7 @@ async function closePosition(symbol) {
     }
 }
 
-async function closeIndiaPosition(symbol) {
-    if (!confirm(`Close India position for ${symbol}?`)) return;
-    try {
-        const res = await fetch(`/api/india/close_position/${symbol}`, { method: 'POST' });
-        const data = await res.json();
-        alert(data.message);
-        fetchCurrentTabData();
-    } catch (e) {
-        alert("Failed to close position: " + e);
-    }
-}
+
 
 async function toggleKillSwitch() {
     try {

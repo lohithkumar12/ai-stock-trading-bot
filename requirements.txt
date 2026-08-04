@@ -1,7 +1,6 @@
 # Automated AI Stock Trading Bot — Dependencies
 # Install: pip install -r requirements.txt
 
-alpaca-py>=0.21.0          # Official Alpaca SDK (Trading + Market Data)
 pandas>=2.0.0              # Data manipulation & analysis
 numpy>=1.24.0              # Numerical computations
 python-dotenv>=1.0.0       # .env file loader

@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AI Quant Dashboard — US & India Markets</title>
+    <title>AI Quant Dashboard — India Market</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -17,17 +17,8 @@
                 <i class="fa-solid fa-robot logo-icon"></i>
                 <div class="logo-text">
                     <h1>AI Quant Dashboard</h1>
-                    <span class="sub">US & India Trading Engine</span>
+                    <span class="sub">India Trading Engine</span>
                 </div>
-            </div>
-
-            <div class="market-tabs">
-                <button class="tab-btn active" id="tab-us" onclick="switchMarketTab('us')">
-                    🇺🇸 US Markets
-                </button>
-                <button class="tab-btn" id="tab-india" onclick="switchMarketTab('india')">
-                    🇮🇳 India (NSE)
-                </button>
             </div>
 
             <div class="nav-badges">
@@ -86,14 +77,14 @@
                     <div class="kpi-info">
                         <span class="kpi-label">Active Positions</span>
                         <h2 class="kpi-value" id="positions-count">0</h2>
-                        <span class="kpi-sub" id="kpi-universe-sub">Universe: US Large-Caps</span>
+                        <span class="kpi-sub" id="kpi-universe-sub">Universe: Nifty Large-Caps (Dhan / NSE)</span>
                     </div>
                 </div>
             </section>
 
             <section class="panel">
                 <div class="panel-header">
-                    <h3 id="scanner-title"><i class="fa-solid fa-radar"></i> Strategy Scanner</h3>
+                    <h3 id="scanner-title"><i class="fa-solid fa-radar"></i> Strategy Scanner (NSE)</h3>
                     <span class="timestamp-label" id="last-updated">Updating...</span>
                 </div>
                 <div class="scanner-grid" id="scanner-container">

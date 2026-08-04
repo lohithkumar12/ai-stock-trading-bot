@@ -1,8 +1,7 @@
 """
 config.py — Central Configuration Module
 ==========================================
-Dual-market bot:
-  US   → Alpaca PAPER (fake USD) + live US market data
+India-only bot:
   India → Dhan (default) or Angel One — paper sim or live INR
 """
 
@@ -39,8 +38,6 @@ TEST_MODE: bool = False
 # ===========================================================================
 # Market Toggles
 # ===========================================================================
-# India-first default: US off unless explicitly enabled.
-US_ENABLED: bool = _env_bool("US_ENABLED", "false")
 # India paper sim uses LIVE broker quotes/candles but places NO real orders.
 # Forced OFF automatically when LIVE_CONFIRMED (real money).
 _INDIA_PAPER_ENV: bool = _env_bool("INDIA_PAPER", "true")
@@ -48,46 +45,7 @@ INDIA_PAPER: bool = _INDIA_PAPER_ENV and not LIVE_CONFIRMED
 
 INDIA_PAPER_STARTING_CASH: float = _env_float("INDIA_PAPER_STARTING_CASH", "100000")
 
-# ===========================================================================
-# US Market — Alpaca PAPER (default for testing)
-# ===========================================================================
-ALPACA_API_KEY: str = os.getenv("ALPACA_API_KEY", "").strip()
-ALPACA_SECRET_KEY: str = os.getenv("ALPACA_SECRET_KEY", "").strip()
-BASE_URL: str = os.getenv(
-    "BASE_URL", "https://paper-api.alpaca.markets"
-).strip()
 
-IS_PLACEHOLDER_KEY: bool = (
-    not ALPACA_API_KEY
-    or "your_api_key_here" in ALPACA_API_KEY
-    or "your_copied_api_key" in ALPACA_API_KEY
-)
-
-# Paper = fake USD on Alpaca (still uses LIVE market prices)
-PAPER_TRADING: bool = _env_bool("ALPACA_PAPER", "true")
-
-STOCK_UNIVERSE: list[str] = [
-    "SPY",
-    "QQQ",
-    "AAPL",
-    "MSFT",
-    "GOOGL",
-    "NVDA",
-    "AMZN",
-    "META",
-    "TSLA",
-    "JPM",
-    "V",
-    "LLY",
-]
-
-# Simple sector clusters — avoid piling into the same theme
-US_CORRELATION_CLUSTERS: dict[str, list[str]] = {
-    "us_tech": ["AAPL", "MSFT", "GOOGL", "NVDA", "AMZN", "META", "TSLA", "QQQ"],
-    "us_finance": ["JPM", "V"],
-    "us_index": ["SPY"],
-    "us_health": ["LLY"],
-}
 
 # ===========================================================================
 # India Market — Dhan (preferred) or Angel One
@@ -189,15 +147,7 @@ CONFIRM_BARS: int = _env_int("CONFIRM_BARS", "2")  # require N bars of signal
 
 STRICT_SELL: bool = _env_bool("STRICT_SELL", "true")
 
-# Per-market strategy params (US)
-US_SMA_SLOW: int = _env_int("US_SMA_SLOW", str(SMA_SLOW))
-US_SMA_FAST: int = _env_int("US_SMA_FAST", str(SMA_FAST))
-US_EMA_PULLBACK: int = _env_int("US_EMA_PULLBACK", str(EMA_PULLBACK))
-US_RSI_PERIOD: int = _env_int("US_RSI_PERIOD", str(RSI_PERIOD))
-US_RSI_BUY: float = _env_float("US_RSI_BUY", str(RSI_BUY_THRESHOLD))
-US_RSI_SELL: float = _env_float("US_RSI_SELL", str(RSI_SELL_THRESHOLD))
-US_BB_STD: float = _env_float("US_BB_STD", str(BB_STD_DEV))
-US_ADX_RANGE_MAX: float = _env_float("US_ADX_RANGE_MAX", str(ADX_RANGE_MAX))
+
 
 # Per-market strategy params (India)
 INDIA_SMA_SLOW: int = _env_int("INDIA_SMA_SLOW", str(SMA_SLOW))
@@ -233,18 +183,15 @@ ALLOW_OPEN_CLOSE_WINDOW: bool = _env_bool("ALLOW_OPEN_CLOSE_WINDOW", "false")
 # Entry style: limit by default; market only if explicitly enabled
 ALLOW_MARKET_ENTRIES: bool = _env_bool("ALLOW_MARKET_ENTRIES", "false")
 
-# US limit fill timeout → cancel / requote
-LIMIT_FILL_TIMEOUT_SEC: int = _env_int("LIMIT_FILL_TIMEOUT_SEC", "120")
-LIMIT_REQUOTE_MAX: int = _env_int("LIMIT_REQUOTE_MAX", "2")
 
-# Sync software trailing stops onto Alpaca stop orders
+
+# Sync software trailing stops onto broker stop orders
 SYNC_BROKER_STOPS: bool = _env_bool("SYNC_BROKER_STOPS", "true")
 
-# Multi-timeframe: require daily close > SMA200 for US 1H buys
+# Multi-timeframe: require daily close > SMA200 for 1H buys
 USE_MTF_FILTER: bool = _env_bool("USE_MTF_FILTER", "true")
-# Index regime: only buy stocks when SPY (US) / NIFTY proxy is in uptrend
+# Index regime: only buy stocks when NIFTY proxy is in uptrend
 USE_REGIME_FILTER: bool = _env_bool("USE_REGIME_FILTER", "true")
-REGIME_SYMBOL_US: str = os.getenv("REGIME_SYMBOL_US", "SPY").strip().upper()
 REGIME_SYMBOL_INDIA: str = os.getenv("REGIME_SYMBOL_INDIA", "RELIANCE").strip().upper()
 
 # Backtest realism
@@ -264,5 +211,5 @@ TRADE_JOURNAL_PATH: str = os.getenv("TRADE_JOURNAL_PATH", "trade_journal.db").st
 # ===========================================================================
 # Loop Intervals (bot process runs 24/7; trades only in market hours)
 # ===========================================================================
-LOOP_INTERVAL_SEC: int = _env_int("LOOP_INTERVAL_SEC", "300")
+
 INDIA_LOOP_INTERVAL_SEC: int = _env_int("INDIA_LOOP_INTERVAL_SEC", "300")

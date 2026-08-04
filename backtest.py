@@ -2,8 +2,8 @@
 backtest.py — Historical backtest for strategy comparison
 ================================================================
 Examples:
-  python backtest.py --market US --compare --timeframe 1Day
-  python backtest.py --market US --compare --symbols SPY,QQQ,AAPL,NVDA,JPM
+  python backtest.py --market INDIA --compare --timeframe 1Day
+  python backtest.py --market INDIA --compare --symbols RELIANCE,TCS,INFY
   python backtest.py --demo --compare
   python backtest.py --csv path/to/bars.csv --strategy regime_adaptive
 """
@@ -80,50 +80,6 @@ def synthetic_bars(n: int = 400, seed: int = 42) -> pd.DataFrame:
         {"open": open_, "high": high, "low": low, "close": close, "volume": volume},
         index=idx,
     )
-
-
-def fetch_alpaca_bars(symbol: str, timeframe: str, lookback: int) -> Optional[pd.DataFrame]:
-    if config.IS_PLACEHOLDER_KEY:
-        return None
-    try:
-        from datetime import datetime, timedelta
-        from alpaca.data.historical import StockHistoricalDataClient
-        from alpaca.data.requests import StockBarsRequest
-        from data_feed import TIMEFRAME_MAP
-
-        tf = TIMEFRAME_MAP.get(timeframe, TIMEFRAME_MAP["1Day"])
-        if timeframe == "1Day":
-            calendar_days = int(lookback * 1.7) + 120
-        elif timeframe == "1Hour":
-            calendar_days = int(lookback / 6.5 * 2.2) + 40
-        else:
-            calendar_days = max(lookback, 60)
-
-        client = StockHistoricalDataClient(
-            api_key=config.ALPACA_API_KEY,
-            secret_key=config.ALPACA_SECRET_KEY,
-        )
-        request = StockBarsRequest(
-            symbol_or_symbols=symbol,
-            timeframe=tf,
-            start=datetime.now() - timedelta(days=calendar_days),
-            limit=lookback,
-        )
-        bars = client.get_stock_bars(request)
-        df = bars.df
-        if df.empty:
-            return None
-        if isinstance(df.index, pd.MultiIndex):
-            df = df.xs(symbol, level="symbol")
-        df = df.tail(lookback)
-        logger.info(
-            f"Backtest fetch {symbol}: {len(df)} bars "
-            f"({timeframe}, {df.index[0]} -> {df.index[-1]})"
-        )
-        return df
-    except Exception as e:
-        logger.error(f"Alpaca fetch failed for {symbol}: {e}")
-        return None
 
 
 def run_backtest(
@@ -305,13 +261,13 @@ def print_leaderboard(results: list[BacktestResult]):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Backtest pluggable strategies")
-    parser.add_argument("--market", default="US", choices=["US", "INDIA"])
+    parser.add_argument("--market", default="INDIA", choices=["INDIA"])
     parser.add_argument(
         "--strategy",
         default=config.STRATEGY_NAME,
         help="trend_pullback | mean_reversion | regime_adaptive",
     )
-    parser.add_argument("--symbol", default="SPY")
+    parser.add_argument("--symbol", default="RELIANCE")
     parser.add_argument(
         "--symbols",
         default=None,
@@ -336,14 +292,9 @@ def main(argv=None):
     for symbol in symbols:
         if args.csv and len(symbols) == 1:
             df = load_csv(args.csv)
-        elif args.demo or config.IS_PLACEHOLDER_KEY:
+        else:
             logger.info(f"{symbol}: using synthetic demo bars")
             df = synthetic_bars(seed=abs(hash(symbol)) % 10_000)
-        else:
-            df = fetch_alpaca_bars(symbol, args.timeframe, args.lookback)
-            if df is None or df.empty:
-                logger.warning(f"{symbol}: no live bars — synthetic fallback")
-                df = synthetic_bars(seed=abs(hash(symbol)) % 10_000)
 
         logger.info(f"{symbol}: {len(df)} bars loaded — testing {strategies}")
         for name in strategies:
