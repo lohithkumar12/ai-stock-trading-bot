@@ -87,8 +87,15 @@ def _refresh_rs_filter(rs_filter, symbol_dfs: dict):
     if rs_filter is not None and config.USE_RELATIVE_STRENGTH:
         rs_filter.update_scores(symbol_dfs)
 
-
-
+def is_india_market_open() -> bool:
+    """Returns True if current time is between Mon-Fri 9:15 AM - 3:30 PM IST."""
+    now_ist = datetime.now(IST)
+    if now_ist.weekday() >= 5:
+        return False
+    
+    open_time = now_ist.replace(hour=9, minute=15, second=0, microsecond=0)
+    close_time = now_ist.replace(hour=15, minute=30, second=0, microsecond=0)
+    return open_time <= now_ist <= close_time
 
 
 def run_india_loop(strategy, risk_mgr, rs_filter=None):
