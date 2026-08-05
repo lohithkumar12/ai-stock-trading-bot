@@ -261,7 +261,7 @@ def print_leaderboard(results: list[BacktestResult]):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Backtest pluggable strategies")
-    parser.add_argument("--market", default="INDIA", choices=["INDIA"])
+    parser.add_argument("--market", default="INDIA", choices=["INDIA", "FNO"])
     parser.add_argument(
         "--strategy",
         default=config.STRATEGY_NAME,
@@ -278,6 +278,11 @@ def main(argv=None):
     parser.add_argument("--csv", default=None, help="OHLCV CSV path")
     parser.add_argument("--compare", action="store_true", help="Compare all built-in strategies")
     parser.add_argument("--demo", action="store_true", help="Use synthetic bars")
+    parser.add_argument(
+        "--dhan",
+        action="store_true",
+        help="Fetch Dhan historical OHLC (+ OI when API returns it) for equities/F&O underlyings",
+    )
     parser.add_argument("--equity", type=float, default=100_000.0)
     args = parser.parse_args(argv)
 
@@ -286,12 +291,34 @@ def main(argv=None):
     else:
         symbols = [args.symbol.upper()]
 
+    # F&O market defaults to index underlyings for OHLC/OI fetch
+    if args.market == "FNO" and args.symbol == "RELIANCE" and not args.symbols:
+        symbols = list(getattr(config, "INDIA_FNO_UNIVERSE", ["NIFTY", "BANKNIFTY", "FINNIFTY"]))
+
     strategies = list(COMPARE_STRATEGIES) if args.compare else [args.strategy]
     results: list[BacktestResult] = []
 
     for symbol in symbols:
         if args.csv and len(symbols) == 1:
             df = load_csv(args.csv)
+        elif args.dhan:
+            try:
+                from dhan_broker import get_shared_dhan_broker
+
+                b = get_shared_dhan_broker(auto_login=True)
+                # Longer lookback for F&O underlyings / equities
+                days = min(max(args.lookback, 30), 90 if args.market == "FNO" else 300)
+                df = b.get_historical_candles(symbol, timeframe=args.timeframe, days=days)
+                if df is not None and "oi" in df.columns:
+                    logger.info(f"{symbol}: Dhan OHLC+OI bars loaded (oi col present)")
+                elif df is not None:
+                    logger.info(f"{symbol}: Dhan OHLC bars loaded (OI not in response)")
+            except Exception as e:
+                logger.warning(f"Dhan historical candles fetch failed for {symbol}: {e}")
+                df = None
+            if df is None or df.empty:
+                logger.info(f"{symbol}: Dhan data unavailable — falling back to synthetic bars")
+                df = synthetic_bars(seed=abs(hash(symbol)) % 10_000)
         else:
             logger.info(f"{symbol}: using synthetic demo bars")
             df = synthetic_bars(seed=abs(hash(symbol)) % 10_000)

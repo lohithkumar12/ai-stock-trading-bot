@@ -281,6 +281,21 @@ class RiskManager:
 
         return True
 
+    def can_open_position(self, symbol: str, current_positions) -> bool:
+        """Alias used by F&O / MCX / Currency brokers."""
+        if self.is_kill_switch_active():
+            logger.warning(f"[{self.market}] Kill switch active — block {symbol}")
+            return False
+        if isinstance(current_positions, int):
+            # Legacy call shape: can_open_position(symbol, len(positions))
+            if current_positions >= self.max_open_positions:
+                logger.info(
+                    f"{symbol}: Max open positions ({self.max_open_positions}) reached — skip."
+                )
+                return False
+            return True
+        return self.is_position_allowed(symbol, current_positions or {})
+
     # -----------------------------------------------------------------------
     # Daily Drawdown Kill-Switch
     # -----------------------------------------------------------------------
@@ -311,9 +326,8 @@ class RiskManager:
         )
         return False
 
-    @property
     def is_kill_switch_active(self) -> bool:
-        return self._kill_switch_active
+        return bool(self._kill_switch_active)
 
     def activate_kill_switch(self, reason: str = "manual"):
         self._kill_switch_active = True

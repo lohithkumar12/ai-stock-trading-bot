@@ -463,3 +463,56 @@ function formatINR(val) {
     if (val == null || isNaN(val)) return "₹0.00";
     return new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR', maximumFractionDigits: 2 }).format(val);
 }
+
+async function fetchSegmentsStatus() {
+    try {
+        const res = await fetch('/api/segments/status');
+        if (!res.ok) return;
+        const data = await res.json();
+        const wsEl = document.getElementById("segment-ws-status");
+        const prodEl = document.getElementById("segment-product-type");
+        const fnoEl = document.getElementById("segment-fno-status");
+        const mcxEl = document.getElementById("segment-mcx-status");
+        const fxEl = document.getElementById("segment-fx-status");
+
+        if (wsEl) {
+            const feed = data.dhan_live_feed || {};
+            const isConn = feed.connected;
+            const age = feed.last_heartbeat_age_sec;
+            const sub = feed.subscribed_count != null ? feed.subscribed_count : "?";
+            wsEl.innerHTML = isConn
+                ? `<i class="fa-solid fa-wifi" style="color: #4ade80;"></i> Connected (${sub} sym, ${age}s)`
+                : `<i class="fa-solid fa-wifi" style="color: #f87171;"></i> REST Fallback`;
+        }
+        if (prodEl && data.product_type) {
+            prodEl.textContent = data.product_type + " Mode";
+        }
+        function segLabel(seg) {
+            if (!seg) return "—";
+            const pos = seg.positions_count != null ? seg.positions_count : 0;
+            const util = seg.utilization && seg.utilization.utilization_pct != null
+                ? ` · cap ${seg.utilization.utilization_pct}%`
+                : "";
+            const kill = seg.kill_switch ? " · KILL" : "";
+            const on = seg.enabled ? "" : " (OFF)";
+            return `${seg.mode}${on} · ${pos} pos${util}${kill}`;
+        }
+        if (fnoEl && data.segments.india_fno) {
+            fnoEl.textContent = segLabel(data.segments.india_fno);
+        }
+        if (mcxEl && data.segments.mcx_commodities) {
+            mcxEl.textContent = segLabel(data.segments.mcx_commodities);
+        }
+        if (fxEl && data.segments.currency_fx) {
+            fxEl.textContent = segLabel(data.segments.currency_fx);
+        }
+    } catch (e) {
+        console.debug("Segment status poll error:", e);
+    }
+}
+
+// Global Poll Timers
+document.addEventListener("DOMContentLoaded", () => {
+    fetchSegmentsStatus();
+    setInterval(fetchSegmentsStatus, 5000);
+});

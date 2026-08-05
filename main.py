@@ -212,6 +212,33 @@ def run_india_loop(strategy, risk_mgr, rs_filter=None):
             if closed:
                 logger.info(f"[INDIA] Closed via SL/TP: {closed}")
 
+            if config.INDIA_PRODUCT_TYPE.upper() in ("INTRADAY", "INTRA", "MIS"):
+                now_t = now_ist.time()
+                # Auto square-off window ~15:15 IST (paper + live soft close)
+                if now_t.hour == 15 and now_t.minute >= 15:
+                    if hasattr(india_broker, "square_off_intraday_positions"):
+                        sq = india_broker.square_off_intraday_positions()
+                        if sq:
+                            logger.info(f"[INDIA INTRADAY AUTO-SQUAREOFF] Closed: {sq}")
+                    elif india_broker.paper is not None and hasattr(india_broker.paper, "check_intraday_squareoff"):
+                        marks = {}
+                        for sym in list(india_broker.paper.positions.keys()):
+                            q = india_broker.get_latest_quote(sym)
+                            if q:
+                                marks[sym] = float(q.get("ltp", 0))
+                        sq_closed = india_broker.paper.check_intraday_squareoff(marks)
+                        if sq_closed:
+                            logger.info(f"[INDIA INTRADAY AUTO-SQUAREOFF] Closed positions: {sq_closed}")
+                elif india_broker.paper is not None and hasattr(india_broker.paper, "check_intraday_squareoff"):
+                    marks = {
+                        sym: float(india_broker.get_latest_quote(sym).get("ltp", 0))
+                        for sym in india_broker.paper.positions
+                        if india_broker.get_latest_quote(sym)
+                    }
+                    sq_closed = india_broker.paper.check_intraday_squareoff(marks)
+                    if sq_closed:
+                        logger.info(f"[INDIA INTRADAY AUTO-SQUAREOFF] Closed positions: {sq_closed}")
+
             account = india_broker.get_account_info()
             if account is None:
                 logger.error("[INDIA] Cannot retrieve account info — skipping.")
@@ -653,6 +680,38 @@ def run_bot():
 
     trade_journal.init_db()
 
+    # Automatically load Dhan Scrip Master at startup
+    try:
+        from india_fno_instruments import load_dhan_scrip_master
+
+        load_dhan_scrip_master()
+    except Exception as e:
+        logger.warning(f"Dhan Scrip Master initialization warning: {e}")
+
+    # Subscribe active universes to Live WebSocket feed
+    try:
+        from dhan_live_feed import get_live_feed_manager
+
+        feed_mgr = get_live_feed_manager()
+        if feed_mgr.enabled:
+            n = 0
+            n += feed_mgr.subscribe_universe(config.INDIA_STOCK_UNIVERSE, "NSE_EQ")
+            if config.INDIA_FNO_ENABLED:
+                n += feed_mgr.subscribe_universe(config.INDIA_FNO_UNIVERSE, "NSE_FNO")
+            if config.MCX_ENABLED:
+                n += feed_mgr.subscribe_universe(config.MCX_UNIVERSE, "MCX_COMM")
+            if config.CURRENCY_ENABLED:
+                n += feed_mgr.subscribe_universe(config.CURRENCY_UNIVERSE, "NSE_CURRENCY")
+            # US Global: MarketFeed is India/MCX only — REST/Yahoo fallback documented in status
+            logger.info(
+                f"[FEED] Subscribed {n} instruments across enabled universes "
+                f"(US uses REST/Yahoo fallback)"
+            )
+        else:
+            logger.info("[FEED] Live WebSocket disabled — REST quote mode")
+    except Exception as fe:
+        logger.warning(f"[FEED] Universe live feed subscription warning: {fe}")
+
     try:
         dash_port = int(os.environ.get("PORT", 5000))
         start_dashboard_in_background(port=dash_port)
@@ -682,6 +741,214 @@ def run_bot():
             f"(INDIA_BROKER={config.INDIA_BROKER})"
         )
 
+    def _calc_rsi_adx(df):
+        """Lightweight RSI + ADX for expansion loops (no spam heuristics)."""
+        import pandas as pd
+
+        close = df["close"].astype(float)
+        delta = close.diff()
+        gain = delta.clip(lower=0).rolling(14).mean()
+        loss = (-delta.clip(upper=0)).rolling(14).mean()
+        rs = gain / loss.replace(0, pd.NA)
+        rsi = float((100 - (100 / (1 + rs))).iloc[-1])
+        # Simplified ADX via |+DM - -DM| proxy from high/low if available
+        adx = 25.0
+        if "high" in df.columns and "low" in df.columns:
+            high = df["high"].astype(float)
+            low = df["low"].astype(float)
+            plus_dm = high.diff().clip(lower=0)
+            minus_dm = (-low.diff()).clip(lower=0)
+            tr = (high - low).rolling(14).mean()
+            plus_di = 100 * (plus_dm.rolling(14).mean() / tr.replace(0, pd.NA))
+            minus_di = 100 * (minus_dm.rolling(14).mean() / tr.replace(0, pd.NA))
+            dx = (abs(plus_di - minus_di) / (plus_di + minus_di).replace(0, pd.NA)) * 100
+            adx_v = dx.rolling(14).mean().iloc[-1]
+            if adx_v == adx_v:  # not NaN
+                adx = float(adx_v)
+        atr = float((df["high"] - df["low"]).tail(14).mean()) if "high" in df.columns else 0.0
+        sma_fast = float(close.tail(20).mean())
+        sma_slow = float(close.tail(min(50, len(close))).mean())
+        return rsi, adx, sma_fast, sma_slow, atr
+
+    # --- India F&O loop ---
+    if config.INDIA_FNO_ENABLED:
+
+        def run_fno_loop():
+            logger.info("[FNO] Loop started (09:15-15:30 IST)...")
+            from india_fno_broker import get_shared_fno_broker
+            from fno_strategy import FnoStrategy
+
+            fno_broker = get_shared_fno_broker()
+            fno_strat = FnoStrategy(config.INDIA_FNO_STRATEGY)
+
+            while True:
+                try:
+                    if is_india_market_open():
+                        fno_broker.check_exits()
+                        for sym in config.INDIA_FNO_UNIVERSE:
+                            if fno_broker.risk_mgr.is_kill_switch_active():
+                                logger.warning("[FNO] Kill switch — idle")
+                                break
+                            quote = fno_broker.dhan_broker.get_latest_quote(sym)
+                            if not quote:
+                                continue
+                            spot = float(quote.get("ltp", 0))
+                            df = fno_broker.dhan_broker.get_historical_candles(
+                                sym, timeframe="1Hour", days=30
+                            )
+                            if df is None or len(df) < 30:
+                                continue
+                            rsi, adx, sma_fast, sma_slow, atr = _calc_rsi_adx(df)
+                            sig = fno_strat.generate_signal(
+                                sym,
+                                spot,
+                                rsi=rsi,
+                                adx=adx,
+                                sma_fast=sma_fast,
+                                sma_slow=sma_slow,
+                                atr=atr,
+                            )
+                            if not sig:
+                                continue
+                            chain = fno_broker.get_option_chain(sym)
+                            strike = fno_broker.get_atm_strike(sym, spot, chain=chain)
+                            prem = fno_broker.fetch_live_option_premium(
+                                sym, strike, sig["option_type"]
+                            )
+                            if prem <= 0:
+                                logger.info(f"[FNO] Skip {sym}: no valid premium")
+                                continue
+                            sl = max(prem * 0.5, prem - sig.get("stop_loss_dist", 0) * 0.01)
+                            tp = prem * 1.8
+                            fno_broker.place_option_order(
+                                sym,
+                                strike,
+                                sig["option_type"],
+                                limit_price=prem,
+                                stop_loss=sl,
+                                take_profit=tp,
+                            )
+                    else:
+                        logger.debug("[FNO] Outside India session — idle")
+                    time.sleep(config.INDIA_LOOP_INTERVAL_SEC)
+                except Exception as fe:
+                    logger.error(f"[FNO] Loop error: {fe}", exc_info=True)
+                    time.sleep(config.INDIA_LOOP_INTERVAL_SEC)
+
+        fno_thread = threading.Thread(target=run_fno_loop, daemon=True, name="IndiaFnoLoop")
+        fno_thread.start()
+        logger.info("[FNO] Background loop started")
+
+    # --- MCX Commodities loop ---
+    if config.MCX_ENABLED:
+
+        def run_mcx_loop_runner():
+            logger.info("[MCX] Loop started (09:00-23:30 IST)...")
+            from mcx_broker import get_shared_mcx_broker
+
+            mcx_broker = get_shared_mcx_broker()
+            # Quality gate: require RSI oversold + ADX trend; otherwise log-only
+            idle_until_quality = True
+
+            while True:
+                try:
+                    if mcx_broker.is_mcx_market_open():
+                        mcx_broker.check_exits()
+                        for sym in config.MCX_UNIVERSE:
+                            if mcx_broker.risk_mgr.is_kill_switch_active():
+                                break
+                            quote = mcx_broker.dhan_broker.get_latest_quote(sym)
+                            if not quote:
+                                continue
+                            price = float(quote.get("ltp", 0))
+                            df = mcx_broker.dhan_broker.get_historical_candles(
+                                sym, timeframe="1Hour", days=15
+                            )
+                            if df is None or len(df) < 30:
+                                logger.debug(f"[MCX] {sym}: insufficient candles — idle")
+                                continue
+                            rsi, adx, sma_fast, sma_slow, atr = _calc_rsi_adx(df)
+                            # Defined-risk long-only: RSI<32, uptrend SMA, ADX>18
+                            if rsi < 32.0 and adx > 18.0 and sma_fast >= sma_slow * 0.995:
+                                sl = price - max(atr * 1.5, price * 0.01)
+                                tp = price + max(atr * 2.5, price * 0.015)
+                                logger.info(
+                                    f"[MCX] Signal {sym}: RSI={rsi:.1f} ADX={adx:.1f} @ {price:.2f}"
+                                )
+                                mcx_broker.place_buy_order(
+                                    sym, 1, price, stop_loss=sl, take_profit=tp
+                                )
+                                idle_until_quality = False
+                            elif idle_until_quality:
+                                logger.debug(
+                                    f"[MCX] {sym}: no quality signal (RSI={rsi:.1f} ADX={adx:.1f}) — log-only"
+                                )
+                    else:
+                        logger.debug("[MCX] Outside session — idle")
+                    time.sleep(300)
+                except Exception as me:
+                    logger.error(f"[MCX] Loop error: {me}", exc_info=True)
+                    time.sleep(300)
+
+        mcx_thread = threading.Thread(
+            target=run_mcx_loop_runner, daemon=True, name="MCXLoop"
+        )
+        mcx_thread.start()
+        logger.info("[MCX] Background loop started (Commodities)")
+
+    # --- Currency FX loop ---
+    if config.CURRENCY_ENABLED:
+
+        def run_currency_loop_runner():
+            logger.info("[CURRENCY] Loop started (09:00-17:00 IST)...")
+            from currency_broker import get_shared_currency_broker
+
+            currency_broker = get_shared_currency_broker()
+
+            while True:
+                try:
+                    if currency_broker.is_currency_market_open():
+                        currency_broker.check_exits()
+                        for sym in config.CURRENCY_UNIVERSE:
+                            if currency_broker.risk_mgr.is_kill_switch_active():
+                                break
+                            quote = currency_broker.dhan_broker.get_latest_quote(sym)
+                            if not quote:
+                                continue
+                            price = float(quote.get("ltp", 0))
+                            df = currency_broker.dhan_broker.get_historical_candles(
+                                sym, timeframe="1Hour", days=15
+                            )
+                            if df is None or len(df) < 30:
+                                logger.debug(f"[CURRENCY] {sym}: insufficient candles — idle")
+                                continue
+                            rsi, adx, sma_fast, sma_slow, atr = _calc_rsi_adx(df)
+                            if rsi < 30.0 and adx > 15.0 and price > 0:
+                                sl = price - max(atr * 1.5, price * 0.002)
+                                tp = price + max(atr * 2.0, price * 0.003)
+                                logger.info(
+                                    f"[CURRENCY] Signal {sym}: RSI={rsi:.1f} @ {price:.4f}"
+                                )
+                                currency_broker.place_buy_order(
+                                    sym, 1, price, stop_loss=sl, take_profit=tp
+                                )
+                            else:
+                                logger.debug(
+                                    f"[CURRENCY] {sym}: no quality signal (RSI={rsi:.1f}) — idle"
+                                )
+                    else:
+                        logger.debug("[CURRENCY] Outside session — idle")
+                    time.sleep(300)
+                except Exception as ce:
+                    logger.error(f"[CURRENCY] Loop error: {ce}", exc_info=True)
+                    time.sleep(300)
+
+        curr_thread = threading.Thread(
+            target=run_currency_loop_runner, daemon=True, name="CurrencyLoop"
+        )
+        curr_thread.start()
+        logger.info("[CURRENCY] Background loop started (NSE USDINR)")
+
     # --- US loop ---
     if config.US_ENABLED:
         us_rs = RelativeStrengthFilter() if config.USE_RELATIVE_STRENGTH else None
@@ -703,7 +970,10 @@ def run_bot():
             "[US] Disabled — missing Dhan credentials or US_PAPER/US_LIVE not set"
         )
 
-    logger.info("[MAIN] Process staying alive 24/7 for dashboard + market loops")
+    logger.info(
+        "[MAIN] Process staying alive 24/7 for dashboard + market loops | "
+        "Dead zone ~01:30–09:00 IST weekdays; weekends/holidays closed — NOT 24x7 trading"
+    )
     while True:
         time.sleep(60)
 

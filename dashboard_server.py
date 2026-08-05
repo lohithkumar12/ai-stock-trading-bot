@@ -235,6 +235,90 @@ def get_india_positions():
     return jsonify(positions_list)
 
 
+@app.route("/api/segments/status")
+def get_segments_status():
+    from dhan_live_feed import get_live_feed_manager
+    from india_fno_instruments import master_status
+
+    ws_feed = get_live_feed_manager()
+
+    fno_util = mcx_util = cur_util = {}
+    fno_pos = mcx_pos = cur_pos = {}
+    try:
+        from india_fno_broker import get_shared_fno_broker
+
+        fb = get_shared_fno_broker()
+        fno_util = fb.capital_utilization()
+        fno_pos = fb.get_open_positions()
+    except Exception:
+        pass
+    try:
+        from mcx_broker import get_shared_mcx_broker
+
+        mb = get_shared_mcx_broker()
+        mcx_util = mb.capital_utilization()
+        mcx_pos = mb.get_open_positions()
+    except Exception:
+        pass
+    try:
+        from currency_broker import get_shared_currency_broker
+
+        cb = get_shared_currency_broker()
+        cur_util = cb.capital_utilization()
+        cur_pos = cb.get_open_positions()
+    except Exception:
+        pass
+
+    fno_info = {
+        "enabled": config.INDIA_FNO_ENABLED,
+        "mode": "PAPER" if config.INDIA_FNO_PAPER else ("LIVE" if config.INDIA_FNO_LIVE_CONFIRMED else "DISABLED"),
+        "capital_cap": config.INDIA_FNO_CAPITAL_CAP,
+        "max_lots": config.INDIA_FNO_MAX_LOTS,
+        "utilization": fno_util,
+        "positions_count": len(fno_pos),
+        "kill_switch": fno_util.get("kill_switch", False),
+    }
+    mcx_info = {
+        "enabled": config.MCX_ENABLED,
+        "mode": "PAPER" if config.MCX_PAPER else ("LIVE" if config.MCX_LIVE_CONFIRMED else "DISABLED"),
+        "capital_cap": config.MCX_CAPITAL_CAP,
+        "utilization": mcx_util,
+        "positions_count": len(mcx_pos),
+        "kill_switch": mcx_util.get("kill_switch", False),
+    }
+    currency_info = {
+        "enabled": config.CURRENCY_ENABLED,
+        "mode": "PAPER" if config.CURRENCY_PAPER else ("LIVE" if config.CURRENCY_LIVE_CONFIRMED else "DISABLED"),
+        "capital_cap": config.CURRENCY_CAPITAL_CAP,
+        "utilization": cur_util,
+        "positions_count": len(cur_pos),
+        "kill_switch": cur_util.get("kill_switch", False),
+    }
+    equity_info = {
+        "enabled": config.INDIA_ENABLED,
+        "mode": "PAPER" if config.INDIA_PAPER else ("LIVE" if config.LIVE_CONFIRMED else "DISABLED"),
+        "product_type": config.INDIA_PRODUCT_TYPE,
+    }
+    us_info = {
+        "enabled": config.US_ENABLED,
+        "mode": "PAPER" if config.US_PAPER else ("LIVE" if config.US_LIVE_CONFIRMED else "DISABLED"),
+    }
+
+    return jsonify({
+        "status": "success",
+        "dhan_live_feed": ws_feed.status_summary(),
+        "scrip_master": master_status(),
+        "product_type": config.INDIA_PRODUCT_TYPE,
+        "segments": {
+            "india_equity": equity_info,
+            "india_fno": fno_info,
+            "mcx_commodities": mcx_info,
+            "currency_fx": currency_info,
+            "us_global": us_info,
+        },
+    })
+
+
 @app.route("/api/scanner")
 def get_india_scanner():
     global _india_scanner_cache

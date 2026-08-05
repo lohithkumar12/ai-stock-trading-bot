@@ -93,6 +93,12 @@ INDIA_ENABLED: bool = (
     or (INDIA_BROKER == "angel" and ANGEL_CONFIGURED)
 )
 
+# Product Type: CNC (Equity Delivery), INTRADAY (MIS), MTF (Margin Trading Facility)
+INDIA_PRODUCT_TYPE: str = os.getenv("INDIA_PRODUCT_TYPE", "CNC").strip().upper()
+
+# Dhan Paid Data API Live Feed / WebSocket Toggle
+DHAN_LIVE_WEBSOCKET: bool = _env_bool("DHAN_LIVE_WEBSOCKET", "true") if DHAN_CONFIGURED else False
+
 INDIA_STOCK_UNIVERSE: list[str] = [
     "RELIANCE",
     "TCS",
@@ -115,6 +121,65 @@ INDIA_CORRELATION_CLUSTERS: dict[str, list[str]] = {
     "in_fmcg": ["HINDUNILVR", "ITC"],
     "in_infra": ["LT", "BHARTIARTL"],
 }
+
+# ===========================================================================
+# India F&O (Futures & Options) Market Segment
+# ===========================================================================
+INDIA_FNO_LIVE_TRADING: bool = _env_bool("INDIA_FNO_LIVE_TRADING", "false")
+INDIA_FNO_LIVE_CONFIRM: str = os.getenv("INDIA_FNO_LIVE_CONFIRM", "").strip()
+INDIA_FNO_LIVE_CONFIRMED: bool = INDIA_FNO_LIVE_TRADING and INDIA_FNO_LIVE_CONFIRM == "YES_REAL_MONEY"
+
+_INDIA_FNO_PAPER_ENV: bool = _env_bool("INDIA_FNO_PAPER", "true")
+INDIA_FNO_PAPER: bool = _INDIA_FNO_PAPER_ENV and not INDIA_FNO_LIVE_CONFIRMED
+INDIA_FNO_PAPER_STARTING_CASH: float = _env_float("INDIA_FNO_PAPER_STARTING_CASH", "200000")
+
+INDIA_FNO_ENABLED: bool = DHAN_CONFIGURED and _env_bool("INDIA_FNO_ENABLED", "true")
+INDIA_FNO_UNIVERSE: list[str] = [
+    s.strip().upper()
+    for s in os.getenv("INDIA_FNO_UNIVERSE", "NIFTY,BANKNIFTY,FINNIFTY").split(",")
+    if s.strip()
+]
+INDIA_FNO_MAX_LOTS: int = _env_int("INDIA_FNO_MAX_LOTS", "2")
+INDIA_FNO_STRATEGY: str = os.getenv("INDIA_FNO_STRATEGY", "directional_options").strip().lower()
+INDIA_FNO_CAPITAL_CAP: float = _env_float("INDIA_FNO_CAPITAL_CAP", "200000.0")
+
+# ===========================================================================
+# MCX Commodities Market Segment (Gold, Silver, Crude, NatGas)
+# ===========================================================================
+MCX_LIVE_TRADING: bool = _env_bool("MCX_LIVE_TRADING", "false")
+MCX_LIVE_CONFIRM: str = os.getenv("MCX_LIVE_CONFIRM", "").strip()
+MCX_LIVE_CONFIRMED: bool = MCX_LIVE_TRADING and MCX_LIVE_CONFIRM == "YES_REAL_MONEY"
+
+_MCX_PAPER_ENV: bool = _env_bool("MCX_PAPER", "true")
+MCX_PAPER: bool = _MCX_PAPER_ENV and not MCX_LIVE_CONFIRMED
+MCX_PAPER_STARTING_CASH: float = _env_float("MCX_PAPER_STARTING_CASH", "500000")
+
+MCX_ENABLED: bool = DHAN_CONFIGURED and _env_bool("MCX_ENABLED", "true")
+MCX_UNIVERSE: list[str] = [
+    s.strip().upper()
+    for s in os.getenv("MCX_UNIVERSE", "CRUDEOIL,GOLD,SILVER,NATURALGAS").split(",")
+    if s.strip()
+]
+MCX_CAPITAL_CAP: float = _env_float("MCX_CAPITAL_CAP", "500000.0")
+
+# ===========================================================================
+# Currency Derivatives Market Segment (NSE FX — USDINR)
+# ===========================================================================
+CURRENCY_LIVE_TRADING: bool = _env_bool("CURRENCY_LIVE_TRADING", "false")
+CURRENCY_LIVE_CONFIRM: str = os.getenv("CURRENCY_LIVE_CONFIRM", "").strip()
+CURRENCY_LIVE_CONFIRMED: bool = CURRENCY_LIVE_TRADING and CURRENCY_LIVE_CONFIRM == "YES_REAL_MONEY"
+
+_CURRENCY_PAPER_ENV: bool = _env_bool("CURRENCY_PAPER", "true")
+CURRENCY_PAPER: bool = _CURRENCY_PAPER_ENV and not CURRENCY_LIVE_CONFIRMED
+CURRENCY_PAPER_STARTING_CASH: float = _env_float("CURRENCY_PAPER_STARTING_CASH", "100000")
+
+CURRENCY_ENABLED: bool = DHAN_CONFIGURED and _env_bool("CURRENCY_ENABLED", "true")
+CURRENCY_UNIVERSE: list[str] = [
+    s.strip().upper()
+    for s in os.getenv("CURRENCY_UNIVERSE", "USDINR").split(",")
+    if s.strip()
+]
+CURRENCY_CAPITAL_CAP: float = _env_float("CURRENCY_CAPITAL_CAP", "100000.0")
 
 # ===========================================================================
 # Strategy Selection

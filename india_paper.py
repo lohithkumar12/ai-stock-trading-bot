@@ -225,3 +225,29 @@ class IndiaPaperPortfolio:
     def reset_day_equity(self, equity: float):
         self.start_of_day_equity = equity
         self._save()
+
+    def check_intraday_squareoff(self, mark_prices: dict[str, float]) -> list[str]:
+        """Automatically squares off INTRADAY positions if past 15:15 IST cutoff time."""
+        from datetime import datetime
+        try:
+            from zoneinfo import ZoneInfo
+            IST = ZoneInfo("Asia/Kolkata")
+        except ImportError:
+            import pytz  # type: ignore
+            IST = pytz.timezone("Asia/Kolkata")
+
+        now_ist = datetime.now(IST)
+        # 15:15 IST cut-off for MIS intraday positions
+        cutoff = now_ist.replace(hour=15, minute=15, second=0, microsecond=0)
+        closed = []
+
+        if config.INDIA_PRODUCT_TYPE == "INTRADAY" and now_ist >= cutoff:
+            with _lock:
+                for sym in list(self.positions.keys()):
+                    pos = self.positions[sym]
+                    mark = mark_prices.get(sym, pos.get("avg_entry_price", 0))
+                    if mark > 0:
+                        self.sell(sym, pos["qty"], mark)
+                        closed.append(sym)
+                        logger.warning(f"[INTRADAY AUTO-SQUAREOFF] Closed {sym} @ {mark:.2f} before market close")
+        return closed
