@@ -42,6 +42,10 @@ logger = logging.getLogger(__name__)
 TOKEN_REFRESH_HOURS = 20
 CANDLE_CACHE_SEC = 30.0
 CANDLE_CALL_GAP_SEC = 0.35
+# Dashboard polls every few seconds — cache quotes hard to avoid 429s.
+QUOTE_CACHE_SEC = 45.0
+# After marketfeed 429/401, skip live LTP and use candles for a while.
+MARKETFEED_COOLDOWN_SEC = 90.0
 # Chunk intraday history requests (API can reject very wide ranges).
 INTRADAY_CHUNK_DAYS = 30
 
@@ -83,6 +87,9 @@ class DhanBroker:
         self.last_error = ""
         self._last_candle_call_time = 0.0
         self._candle_cache: dict[str, tuple[float, pd.DataFrame]] = {}
+        self._quote_cache: dict[str, tuple[float, dict]] = {}
+        self._marketfeed_cooldown_until = 0.0
+        self._quote_warn_at: dict[str, float] = {}
         self._login_lock = threading.Lock()
 
         self.paper = IndiaPaperPortfolio() if config.INDIA_PAPER else None
@@ -451,8 +458,38 @@ class DhanBroker:
         except (TypeError, ValueError):
             return None
 
+    def _cache_quote(self, symbol: str, quote: dict) -> dict:
+        self._quote_cache[symbol] = (time.time(), quote)
+        return quote
+
+    def _cached_quote(self, symbol: str) -> dict | None:
+        hit = self._quote_cache.get(symbol)
+        if not hit:
+            return None
+        ts, quote = hit
+        if time.time() - ts > QUOTE_CACHE_SEC:
+            return None
+        return quote
+
+    def _arm_marketfeed_cooldown(self, reason: str) -> None:
+        until = time.time() + MARKETFEED_COOLDOWN_SEC
+        if until > self._marketfeed_cooldown_until:
+            self._marketfeed_cooldown_until = until
+            logger.warning(
+                f"Dhan marketfeed cooldown {MARKETFEED_COOLDOWN_SEC:.0f}s ({reason})"
+            )
+
+    def _quote_warn(self, symbol: str, msg: str) -> None:
+        now = time.time()
+        last = self._quote_warn_at.get(symbol, 0.0)
+        if now - last < 60.0:
+            logger.debug(msg)
+            return
+        self._quote_warn_at[symbol] = now
+        logger.warning(msg)
+
     def _quote_from_candle_cache(self, symbol: str) -> dict | None:
-        """Fallback when marketfeed LTP is unavailable (Data API gaps)."""
+        """Fallback when marketfeed LTP is unavailable (rate limit / Data API)."""
         cached = self._candle_cache.get(symbol)
         if not cached:
             return None
@@ -462,18 +499,30 @@ class DhanBroker:
         close = float(df["close"].iloc[-1])
         if close <= 0:
             return None
-        logger.warning(
-            f"{symbol}: marketfeed LTP unavailable — using last candle close {close:.2f}"
+        self._quote_warn(
+            symbol,
+            f"{symbol}: marketfeed LTP unavailable — using last candle close {close:.2f}",
         )
-        return {
-            "ltp": close,
-            "ask_price": close,
-            "symbol": symbol,
-            "exchange": get_exchange(symbol),
-            "source": "candle_close",
-        }
+        return self._cache_quote(
+            symbol,
+            {
+                "ltp": close,
+                "ask_price": close,
+                "symbol": symbol,
+                "exchange": get_exchange(symbol),
+                "source": "candle_close",
+            },
+        )
 
     def get_latest_quote(self, symbol: str) -> dict | None:
+        cached = self._cached_quote(symbol)
+        if cached:
+            return cached
+
+        # Prefer candles while marketfeed is cooling down (dashboard polls often).
+        if time.time() < self._marketfeed_cooldown_until:
+            return self._quote_from_candle_cache(symbol)
+
         self.ensure_session()
         if not self.dhan:
             return self._quote_from_candle_cache(symbol)
@@ -486,28 +535,52 @@ class DhanBroker:
         segment = self._exchange_segment(symbol)
         securities = {segment: [int(sec_id)]}
         try:
-            last_resp = None
-            for method_name in ("ticker_data", "ohlc_data", "quote_data"):
-                method = getattr(self.dhan, method_name, None)
-                if method is None:
-                    continue
-                resp = method(securities)
-                last_resp = resp
-                if not self._ok(resp):
-                    continue
-                ltp = self._extract_ltp(self._data(resp), segment, str(sec_id))
-                if ltp is not None:
-                    return {
-                        "ltp": ltp,
-                        "ask_price": ltp,
-                        "symbol": symbol,
-                        "exchange": get_exchange(symbol),
-                        "source": method_name,
-                    }
+            # One endpoint only — cascading ltp→ohlc→quote caused 429 storms.
+            method = getattr(self.dhan, "ticker_data", None) or getattr(
+                self.dhan, "ohlc_data", None
+            )
+            if method is None:
+                return self._quote_from_candle_cache(symbol)
 
-            logger.warning(f"{symbol}: LTP parse failed — {last_resp}")
-            return self._quote_from_candle_cache(symbol)
+            resp = method(securities)
+            status_code = None
+            if isinstance(resp, dict):
+                remarks = resp.get("remarks") or {}
+                if isinstance(remarks, dict):
+                    status_code = remarks.get("status_code") or remarks.get("error_code")
+
+            if not self._ok(resp):
+                raw = str(resp).lower()
+                if "429" in raw or status_code in (429, "429", "DH-904"):
+                    self._arm_marketfeed_cooldown("HTTP 429 rate limit")
+                elif "401" in raw or status_code in (401, "401", "DH-901"):
+                    self._arm_marketfeed_cooldown("HTTP 401 / auth")
+                else:
+                    self._quote_warn(symbol, f"{symbol}: LTP parse failed — {resp}")
+                    # Soft cooldown so dashboard doesn't retry every 3s
+                    self._arm_marketfeed_cooldown("marketfeed failure")
+                return self._quote_from_candle_cache(symbol)
+
+            ltp = self._extract_ltp(self._data(resp), segment, str(sec_id))
+            if ltp is None:
+                self._quote_warn(symbol, f"{symbol}: LTP missing in marketfeed payload")
+                return self._quote_from_candle_cache(symbol)
+
+            return self._cache_quote(
+                symbol,
+                {
+                    "ltp": ltp,
+                    "ask_price": ltp,
+                    "symbol": symbol,
+                    "exchange": get_exchange(symbol),
+                    "source": "ticker_data",
+                },
+            )
         except Exception as e:
+            msg = str(e).lower()
+            if "429" in msg or "rate" in msg:
+                self._arm_marketfeed_cooldown("exception 429")
+                return self._quote_from_candle_cache(symbol)
             if self._handle_api_error(f"{symbol} LTP", e):
                 return self.get_latest_quote(symbol)
             logger.error(f"{symbol}: LTP error: {e}", exc_info=True)
