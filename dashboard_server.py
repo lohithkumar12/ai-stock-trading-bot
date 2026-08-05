@@ -163,8 +163,10 @@ def get_india_status():
     india_market_open = is_weekday and market_open_time <= now_ist <= market_close_time
 
     india_risk = get_india_risk()
-    sod = bot_state.india_sod_equity(equity)
-    last_eq = float(account_info.get("last_equity") or sod)
+    # Daily P&L vs calendar-day start-of-day equity (bot_state).
+    # Do NOT use paper last_equity alone — it used to be set once forever and
+    # could lock an inflated mark-to-market baseline (~₹1.39L vs real ~₹1.00L).
+    last_eq = float(bot_state.india_sod_equity(equity))
     daily_pl = equity - last_eq
     daily_pl_pct = (daily_pl / last_eq * 100) if last_eq else 0.0
     return jsonify({
@@ -476,8 +478,7 @@ def get_us_status():
 
     us_market_open = us_broker.is_market_open()
     us_risk = get_us_risk()
-    sod = bot_state.us_sod_equity(equity)
-    last_eq = float(account_info.get("last_equity") or sod)
+    last_eq = float(bot_state.us_sod_equity(equity))
     daily_pl = equity - last_eq
     daily_pl_pct = (daily_pl / last_eq * 100) if last_eq else 0.0
 

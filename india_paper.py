@@ -39,7 +39,18 @@ class IndiaPaperPortfolio:
         self.positions: dict[str, dict] = {}  # symbol -> {qty, avg_entry_price}
         self.realized_pl: float = 0.0
         self.start_of_day_equity: float | None = None
+        self.start_of_day_date: str | None = None  # IST calendar date YYYY-MM-DD
         self._load()
+
+    @staticmethod
+    def _ist_today() -> str:
+        try:
+            from zoneinfo import ZoneInfo
+            IST = ZoneInfo("Asia/Kolkata")
+        except ImportError:
+            import pytz  # type: ignore
+            IST = pytz.timezone("Asia/Kolkata")
+        return datetime.now(IST).date().isoformat()
 
     def _load(self):
         if not PORTFOLIO_PATH.exists():
@@ -54,6 +65,7 @@ class IndiaPaperPortfolio:
             self.positions = data.get("positions", {}) or {}
             self.realized_pl = float(data.get("realized_pl", 0))
             self.start_of_day_equity = data.get("start_of_day_equity")
+            self.start_of_day_date = data.get("start_of_day_date")
             logger.info(
                 f"India PAPER portfolio loaded | Cash=Rs {self.cash:,.2f} | "
                 f"Positions={list(self.positions.keys())}"
@@ -67,6 +79,7 @@ class IndiaPaperPortfolio:
             "positions": self.positions,
             "realized_pl": self.realized_pl,
             "start_of_day_equity": self.start_of_day_equity,
+            "start_of_day_date": self.start_of_day_date,
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
         PORTFOLIO_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -80,6 +93,7 @@ class IndiaPaperPortfolio:
             self.positions = {}
             self.realized_pl = 0.0
             self.start_of_day_equity = None
+            self.start_of_day_date = None
             self._save()
             logger.warning(f"India PAPER portfolio RESET | Cash=Rs {self.cash:,.2f}")
 
@@ -87,19 +101,29 @@ class IndiaPaperPortfolio:
         marks = mark_prices or {}
         equity = self.cash
         for symbol, pos in self.positions.items():
-            px = float(marks.get(symbol, pos.get("avg_entry_price", 0)))
+            # Prefer live mark; fall back to entry (never invent a fake LTP for equity)
+            px = float(marks.get(symbol) or pos.get("avg_entry_price", 0) or 0)
             equity += pos["qty"] * px
 
-        if self.start_of_day_equity is None:
+        today = self._ist_today()
+        # Roll SOD each IST calendar day (legacy files without start_of_day_date also rebaseline)
+        if (
+            self.start_of_day_equity is None
+            or self.start_of_day_date != today
+        ):
             self.start_of_day_equity = equity
+            self.start_of_day_date = today
             self._save()
+            logger.info(
+                f"[INDIA PAPER] Start-of-day equity set to Rs {equity:,.2f} ({today})"
+            )
 
         return {
             "equity": round(equity, 2),
             "available_cash": round(self.cash, 2),
             "used_margin": 0.0,
             "net": round(equity, 2),
-            "last_equity": round(self.start_of_day_equity, 2),
+            "last_equity": round(float(self.start_of_day_equity), 2),
             "paper": True,
         }
 

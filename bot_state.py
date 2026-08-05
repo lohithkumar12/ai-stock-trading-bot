@@ -91,6 +91,18 @@ def india_sod_equity(current_equity: float) -> float:
         if _india_sod.get("date") != today or _india_sod.get("equity") is None:
             _india_sod["date"] = today
             _india_sod["equity"] = float(current_equity)
+        else:
+            stored = float(_india_sod["equity"])
+            cur = float(current_equity)
+            # Heal inflated SOD from temporary bad marks (e.g. paper fallback prices).
+            # Only correct downward when gap is large (>15%).
+            if stored > 0 and cur > 0 and (stored - cur) / stored > 0.15:
+                logger = __import__("logging").getLogger(__name__)
+                logger.warning(
+                    f"[INDIA] Rebaselining start-of-day equity "
+                    f"Rs {stored:,.2f} → Rs {cur:,.2f} (inflated mark heal)"
+                )
+                _india_sod["equity"] = cur
         return float(_india_sod["equity"])
 
 
