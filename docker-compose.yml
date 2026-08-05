@@ -23,6 +23,7 @@ services:
       PORT: "8080"
       TRADE_JOURNAL_PATH: /app/data/trade_journal.db
       INDIA_PAPER_PORTFOLIO_PATH: /app/data/india_paper_portfolio.json
+      US_PAPER_PORTFOLIO_PATH: /app/data/us_paper_portfolio.json
     volumes:
       - bot_data:/app/data
       - bot_logs:/app/logs
