@@ -1,14 +1,12 @@
 # ============================================================
-# AI Stock Trading Bot — Dockerfile (same pattern as AI UseCase)
+# AI Stock Trading Bot — Dockerfile
+# No apt-get: all deps ship as prebuilt wheels (works on
+# locked-down VMs that cannot reach deb.debian.org).
 # ============================================================
 
 FROM python:3.11-slim AS builder
 
 WORKDIR /build
-
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends gcc libffi-dev && \
-    rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
