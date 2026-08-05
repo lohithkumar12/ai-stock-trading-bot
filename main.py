@@ -231,22 +231,35 @@ def run_india_loop(strategy, risk_mgr, rs_filter=None):
                 atr = strategy.latest_atr(df)
 
                 if signal == "BUY":
-                    if not tradable_window or not regime_ok:
+                    if not tradable_window:
+                        logger.info(f"{symbol}: BUY skipped — outside tradable session window")
+                        continue
+                    if not regime_ok:
+                        logger.info(f"{symbol}: BUY skipped — regime filter blocked entries")
                         continue
                     if not risk_mgr.is_position_allowed(symbol, current_positions):
                         continue
 
                     quote = india_broker.get_latest_quote(symbol)
-                    if quote is None:
+                    # Candle close already used for the signal — safe paper/live fallback
+                    # when Dhan marketfeed LTP is down / not subscribed.
+                    limit_price = None
+                    if quote and quote.get("ltp"):
+                        limit_price = float(quote["ltp"])
+                    elif snap.get("price"):
+                        limit_price = float(snap["price"])
+                        logger.warning(
+                            f"{symbol}: no live LTP — using signal candle close "
+                            f"{limit_price:.2f} for entry"
+                        )
+                    if limit_price is None or limit_price <= 0:
+                        logger.warning(f"{symbol}: BUY skipped — no usable price")
                         continue
 
                     sizing_equity = min(
                         current_equity,
                         float(account.get("available_cash") or current_equity),
                     )
-                    limit_price = quote["ltp"]
-                    if limit_price <= 0:
-                        continue
 
                     sl = risk_mgr.get_stop_loss_price(limit_price, atr)
                     tp = risk_mgr.get_take_profit_price(
@@ -257,6 +270,10 @@ def run_india_loop(strategy, risk_mgr, rs_filter=None):
                         sizing_equity, limit_price, stop_distance=stop_dist
                     )
                     if qty <= 0:
+                        logger.warning(
+                            f"{symbol}: BUY skipped — sized to 0 shares "
+                            f"(price={limit_price:.2f}, equity={sizing_equity:.0f})"
+                        )
                         continue
 
                     order_id = india_broker.place_buy_order(
@@ -267,6 +284,11 @@ def run_india_loop(strategy, risk_mgr, rs_filter=None):
                         take_profit_price=tp,
                         atr=atr,
                     )
+                    if not order_id:
+                        logger.warning(
+                            f"{symbol}: BUY order failed — "
+                            f"{getattr(india_broker, 'last_error', 'unknown')}"
+                        )
                     if order_id:
                         risk_mgr.register_trade(symbol, limit_price, sl, atr)
                         trade_journal.record_entry(

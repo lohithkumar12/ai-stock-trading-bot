@@ -421,53 +421,97 @@ class DhanBroker:
     # -----------------------------------------------------------------------
     # Quotes
     # -----------------------------------------------------------------------
+    def _extract_ltp(self, data, segment: str, sec_id: str) -> float | None:
+        """Parse LTP from ticker / ohlc / quote marketfeed payloads."""
+        if not isinstance(data, dict):
+            return None
+
+        bucket = data.get(segment) or data.get(str(sec_id)) or data
+        if not isinstance(bucket, dict):
+            return None
+
+        node = bucket.get(str(sec_id)) or bucket.get(int(sec_id)) or bucket
+        if not isinstance(node, dict):
+            return None
+
+        ltp = (
+            node.get("last_price")
+            or node.get("LTP")
+            or node.get("ltp")
+            or node.get("last_trade_price")
+            or (node.get("ohlc") or {}).get("close")
+            or node.get("close")
+            or node.get("average_price")
+        )
+        if ltp is None:
+            return None
+        try:
+            val = float(ltp)
+            return val if val > 0 else None
+        except (TypeError, ValueError):
+            return None
+
+    def _quote_from_candle_cache(self, symbol: str) -> dict | None:
+        """Fallback when marketfeed LTP is unavailable (Data API gaps)."""
+        cached = self._candle_cache.get(symbol)
+        if not cached:
+            return None
+        _, df = cached
+        if df is None or df.empty or "close" not in df.columns:
+            return None
+        close = float(df["close"].iloc[-1])
+        if close <= 0:
+            return None
+        logger.warning(
+            f"{symbol}: marketfeed LTP unavailable — using last candle close {close:.2f}"
+        )
+        return {
+            "ltp": close,
+            "ask_price": close,
+            "symbol": symbol,
+            "exchange": get_exchange(symbol),
+            "source": "candle_close",
+        }
+
     def get_latest_quote(self, symbol: str) -> dict | None:
         self.ensure_session()
         if not self.dhan:
-            return None
+            return self._quote_from_candle_cache(symbol)
 
         sec_id = self._security_id(symbol)
         if not sec_id:
             logger.error(f"No security_id for {symbol}")
-            return None
+            return self._quote_from_candle_cache(symbol)
 
         segment = self._exchange_segment(symbol)
+        securities = {segment: [int(sec_id)]}
         try:
-            resp = self.dhan.ohlc_data({segment: [int(sec_id)]})
-            if not self._ok(resp):
-                # Fallback to full quote packet
-                resp = self.dhan.quote_data({segment: [int(sec_id)]})
-            data = self._data(resp)
-            ltp = None
-            if isinstance(data, dict):
-                # Nested: {NSE_EQ: {sec_id: {...}}}
-                bucket = data.get(segment) or data.get(str(sec_id)) or data
-                if isinstance(bucket, dict):
-                    node = bucket.get(str(sec_id)) or bucket.get(int(sec_id)) or bucket
-                    if isinstance(node, dict):
-                        ltp = (
-                            node.get("last_price")
-                            or node.get("LTP")
-                            or node.get("ltp")
-                            or (node.get("ohlc") or {}).get("close")
-                        )
-                        if ltp is None and "average_price" in node:
-                            ltp = node.get("average_price")
-            if ltp is None:
-                logger.warning(f"{symbol}: LTP parse failed — {resp}")
-                return None
+            last_resp = None
+            for method_name in ("ticker_data", "ohlc_data", "quote_data"):
+                method = getattr(self.dhan, method_name, None)
+                if method is None:
+                    continue
+                resp = method(securities)
+                last_resp = resp
+                if not self._ok(resp):
+                    continue
+                ltp = self._extract_ltp(self._data(resp), segment, str(sec_id))
+                if ltp is not None:
+                    return {
+                        "ltp": ltp,
+                        "ask_price": ltp,
+                        "symbol": symbol,
+                        "exchange": get_exchange(symbol),
+                        "source": method_name,
+                    }
 
-            return {
-                "ltp": float(ltp),
-                "ask_price": float(ltp),
-                "symbol": symbol,
-                "exchange": get_exchange(symbol),
-            }
+            logger.warning(f"{symbol}: LTP parse failed — {last_resp}")
+            return self._quote_from_candle_cache(symbol)
         except Exception as e:
             if self._handle_api_error(f"{symbol} LTP", e):
                 return self.get_latest_quote(symbol)
             logger.error(f"{symbol}: LTP error: {e}", exc_info=True)
-            return None
+            return self._quote_from_candle_cache(symbol)
 
     # -----------------------------------------------------------------------
     # Live gate
