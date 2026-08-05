@@ -23,6 +23,7 @@ _health: dict[str, Any] = {
     "started_at": time.time(),
 }
 _india_sod: dict[str, Any] = {"date": None, "equity": None}
+_us_sod: dict[str, Any] = {"date": None, "equity": None}
 
 
 def publish_signals(market: str, items: list[dict]) -> None:
@@ -91,3 +92,18 @@ def india_sod_equity(current_equity: float) -> float:
             _india_sod["date"] = today
             _india_sod["equity"] = float(current_equity)
         return float(_india_sod["equity"])
+
+
+def us_sod_equity(current_equity: float) -> float:
+    """Return start-of-day equity for US (sticky per America/New_York date)."""
+    from datetime import datetime as dt
+    try:
+        from zoneinfo import ZoneInfo
+    except ImportError:
+        from backports.zoneinfo import ZoneInfo  # type: ignore
+    today_et = dt.now(ZoneInfo("America/New_York")).date().isoformat()
+    with _lock:
+        if _us_sod.get("date") != today_et or _us_sod.get("equity") is None:
+            _us_sod["date"] = today_et
+            _us_sod["equity"] = float(current_equity)
+        return float(_us_sod["equity"])

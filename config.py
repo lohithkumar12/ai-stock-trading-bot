@@ -1,8 +1,9 @@
 """
 config.py — Central Configuration Module
 ==========================================
-India-only bot:
+Dual-market bot:
   India → Dhan (default) or Angel One — paper sim or live INR
+  US    → Dhan Global Stocks — paper sim or live USD
 """
 
 import os
@@ -213,3 +214,54 @@ TRADE_JOURNAL_PATH: str = os.getenv("TRADE_JOURNAL_PATH", "trade_journal.db").st
 # ===========================================================================
 
 INDIA_LOOP_INTERVAL_SEC: int = _env_int("INDIA_LOOP_INTERVAL_SEC", "300")
+
+# ===========================================================================
+# US Market — Dhan Global Stocks
+# ===========================================================================
+# Separate live safety gate for US (independent from India):
+#   US_LIVE_TRADING=true + US_LIVE_CONFIRM=YES_REAL_MONEY
+US_LIVE_TRADING: bool = _env_bool("US_LIVE_TRADING", "false")
+US_LIVE_CONFIRM: str = os.getenv("US_LIVE_CONFIRM", "").strip()
+US_LIVE_CONFIRMED: bool = US_LIVE_TRADING and US_LIVE_CONFIRM == "YES_REAL_MONEY"
+
+# Paper sim: live Dhan US quotes, fake USD (no real global orders).
+# Forced OFF automatically when US_LIVE_CONFIRMED.
+_US_PAPER_ENV: bool = _env_bool("US_PAPER", "true")
+US_PAPER: bool = _US_PAPER_ENV and not US_LIVE_CONFIRMED
+
+US_PAPER_STARTING_CASH: float = _env_float("US_PAPER_STARTING_CASH", "10000")
+
+# US enabled when Dhan is configured (shared credentials) and either paper or live
+US_ENABLED: bool = DHAN_CONFIGURED and (US_PAPER or US_LIVE_CONFIRMED or _env_bool("US_ENABLED", "false"))
+
+US_STOCK_UNIVERSE: list[str] = [
+    s.strip().upper()
+    for s in os.getenv(
+        "US_STOCK_UNIVERSE",
+        "AAPL,MSFT,GOOGL,AMZN,NVDA,META,TSLA,JPM,V,UNH",
+    ).split(",")
+    if s.strip()
+]
+
+US_CORRELATION_CLUSTERS: dict[str, list[str]] = {
+    "us_mega_tech": ["AAPL", "MSFT", "GOOGL", "META"],
+    "us_ai_semi": ["NVDA", "TSLA"],
+    "us_ecommerce": ["AMZN"],
+    "us_finance": ["JPM", "V"],
+    "us_healthcare": ["UNH"],
+}
+
+# Per-market strategy params (US)
+US_SMA_SLOW: int = _env_int("US_SMA_SLOW", str(SMA_SLOW))
+US_SMA_FAST: int = _env_int("US_SMA_FAST", str(SMA_FAST))
+US_EMA_PULLBACK: int = _env_int("US_EMA_PULLBACK", str(EMA_PULLBACK))
+US_RSI_PERIOD: int = _env_int("US_RSI_PERIOD", str(RSI_PERIOD))
+US_RSI_BUY: float = _env_float("US_RSI_BUY", str(RSI_BUY_THRESHOLD))
+US_RSI_SELL: float = _env_float("US_RSI_SELL", str(RSI_SELL_THRESHOLD))
+US_BB_STD: float = _env_float("US_BB_STD", str(BB_STD_DEV))
+US_ADX_RANGE_MAX: float = _env_float("US_ADX_RANGE_MAX", str(ADX_RANGE_MAX))
+
+REGIME_SYMBOL_US: str = os.getenv("REGIME_SYMBOL_US", "AAPL").strip().upper()
+
+US_LOOP_INTERVAL_SEC: int = _env_int("US_LOOP_INTERVAL_SEC", "300")
+

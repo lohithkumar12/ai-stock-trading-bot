@@ -17,8 +17,17 @@
                 <i class="fa-solid fa-robot logo-icon"></i>
                 <div class="logo-text">
                     <h1>AI Quant Dashboard</h1>
-                    <span class="sub">India Trading Engine</span>
+                    <span class="sub" id="header-sub">India Trading Engine</span>
                 </div>
+            </div>
+
+            <div class="market-tabs">
+                <button class="tab-btn active" id="tab-india" onclick="switchMarket('INDIA')">
+                    🇮🇳 India (NSE)
+                </button>
+                <button class="tab-btn" id="tab-us" onclick="switchMarket('US')">
+                    🇺🇸 US (Dhan Global)
+                </button>
             </div>
 
             <div class="nav-badges">

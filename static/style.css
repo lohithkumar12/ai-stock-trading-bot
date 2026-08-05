@@ -213,6 +213,17 @@ body {
     border-radius: 6px;
 }
 
+.btn-buy {
+    background: var(--success);
+    color: white;
+    box-shadow: 0 4px 14px var(--success-glow);
+}
+
+.btn-buy:hover {
+    background: #059669;
+    transform: translateY(-1px);
+}
+
 /* ── Dashboard Grid ────────────────────────────────────────────────────── */
 .dashboard-grid {
     display: flex;

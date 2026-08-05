@@ -1,8 +1,9 @@
 # Environment secrets — NEVER commit this
 .env
 
-# Virtual India paper portfolio state
+# Virtual paper portfolio state
 india_paper_portfolio.json
+us_paper_portfolio.json
 
 # Trade journal (local SQLite)
 trade_journal.db
