@@ -53,6 +53,45 @@ _shared_broker: "USBroker | None" = None
 _shared_lock = threading.Lock()
 
 
+def _fetch_yahoo_candles(symbol: str) -> pd.DataFrame | None:
+    """Fallback market data for US equities via Yahoo Finance chart API when Dhan Global is closed or unactivated."""
+    import requests
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=1y"
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    try:
+        resp = requests.get(url, headers=headers, timeout=8)
+        if resp.status_code == 200:
+            data = resp.json()
+            result = data.get("chart", {}).get("result", [])
+            if result:
+                timestamps = result[0].get("timestamp", [])
+                quote = result[0].get("indicators", {}).get("quote", [{}])[0]
+                opens = quote.get("open", [])
+                highs = quote.get("high", [])
+                lows = quote.get("low", [])
+                closes = quote.get("close", [])
+                volumes = quote.get("volume", [])
+
+                if timestamps and closes:
+                    df = pd.DataFrame(
+                        {
+                            "open": opens,
+                            "high": highs,
+                            "low": lows,
+                            "close": closes,
+                            "volume": [v if v is not None else 0 for v in volumes],
+                        },
+                        index=pd.to_datetime(timestamps, unit="s"),
+                    )
+                    df = df.dropna(subset=["close"]).astype(float).sort_index()
+                    if not df.empty:
+                        logger.info(f"[US] {symbol}: Loaded {len(df)} candles via fallback feed")
+                        return df
+    except Exception as e:
+        logger.debug(f"[US] Fallback feed for {symbol} error: {e}")
+    return None
+
+
 def get_shared_us_broker(auto_login: bool = True) -> "USBroker":
     """Process-wide singleton — bot loop and dashboard must share one session."""
     global _shared_broker
@@ -401,96 +440,83 @@ class USBroker:
         return None
 
     def get_historical_bars(self, symbol: str, days: int = 300) -> pd.DataFrame | None:
-        self.ensure_session()
-        if not self.dhan:
-            return None
-
         sec_id = get_us_security_id(symbol)
-        if not sec_id:
-            logger.error(f"[US] No security_id for {symbol}")
-            return None
-
         now_ts = time.time()
         if symbol in self._candle_cache:
             cache_time, cached_df = self._candle_cache[symbol]
             if now_ts - cache_time < CANDLE_CACHE_SEC:
                 return cached_df
 
-        # Try using Global exchange segment for intraday data
-        to_date = datetime.now()
-        from_date = to_date - timedelta(days=days)
         frames: list[pd.DataFrame] = []
+        if self._logged_in and self.dhan and sec_id:
+            to_date = datetime.now()
+            from_date = to_date - timedelta(days=days)
+            chunk_start = from_date
+            try:
+                while chunk_start < to_date:
+                    chunk_end = min(chunk_start + timedelta(days=INTRADAY_CHUNK_DAYS), to_date)
+                    self._throttle_candles()
 
-        chunk_start = from_date
-        try:
-            while chunk_start < to_date:
-                chunk_end = min(chunk_start + timedelta(days=INTRADAY_CHUNK_DAYS), to_date)
-                self._throttle_candles()
-
-                # Try NSE_FNO segment first (some Dhan SDK versions use this for global),
-                # then fall back to other segment names
-                resp = None
-                for segment in ("NSE_FNO", "GLOBAL", "IDX_I"):
-                    try:
-                        resp = self.dhan.intraday_minute_data(
-                            security_id=str(sec_id),
-                            exchange_segment=segment,
-                            instrument_type="EQUITY",
-                            from_date=chunk_start.strftime("%Y-%m-%d %H:%M:%S"),
-                            to_date=chunk_end.strftime("%Y-%m-%d %H:%M:%S"),
-                            interval=60,
-                        )
-                        if self._ok(resp):
-                            break
-                    except Exception:
-                        continue
-
-                if resp and self._ok(resp):
-                    part = self._parse_intraday(self._data(resp))
-                    if part is not None and not part.empty:
-                        frames.append(part)
-                else:
-                    logger.debug(f"[US] {symbol}: intraday chunk miss: {resp}")
-                chunk_start = chunk_end
-
-            if not frames:
-                # Try historical_daily_data fallback
-                for segment in ("NSE_FNO", "GLOBAL", "IDX_I"):
-                    try:
-                        resp = self.dhan.historical_daily_data(
-                            security_id=str(sec_id),
-                            exchange_segment=segment,
-                            instrument_type="EQUITY",
-                            from_date=from_date.strftime("%Y-%m-%d"),
-                            to_date=to_date.strftime("%Y-%m-%d"),
-                        )
-                        if self._ok(resp):
-                            part = self._parse_intraday(self._data(resp))
-                            if part is not None and not part.empty:
-                                frames.append(part)
+                    resp = None
+                    for segment in ("NSE_FNO", "GLOBAL", "IDX_I"):
+                        try:
+                            resp = self.dhan.intraday_minute_data(
+                                security_id=str(sec_id),
+                                exchange_segment=segment,
+                                instrument_type="EQUITY",
+                                from_date=chunk_start.strftime("%Y-%m-%d %H:%M:%S"),
+                                to_date=chunk_end.strftime("%Y-%m-%d %H:%M:%S"),
+                                interval=60,
+                            )
+                            if self._ok(resp):
                                 break
-                    except Exception:
-                        continue
+                        except Exception:
+                            continue
 
-            if not frames:
-                logger.warning(f"[US] {symbol}: No Dhan candle data (market closed or symbol unindexed)")
-                if symbol in self._candle_cache:
-                    return self._candle_cache[symbol][1]
-                return None
+                    if resp and self._ok(resp):
+                        part = self._parse_intraday(self._data(resp))
+                        if part is not None and not part.empty:
+                            frames.append(part)
+                    chunk_start = chunk_end
 
+                if not frames:
+                    for segment in ("NSE_FNO", "GLOBAL", "IDX_I"):
+                        try:
+                            resp = self.dhan.historical_daily_data(
+                                security_id=str(sec_id),
+                                exchange_segment=segment,
+                                instrument_type="EQUITY",
+                                from_date=from_date.strftime("%Y-%m-%d"),
+                                to_date=to_date.strftime("%Y-%m-%d"),
+                            )
+                            if self._ok(resp):
+                                part = self._parse_intraday(self._data(resp))
+                                if part is not None and not part.empty:
+                                    frames.append(part)
+                                    break
+                        except Exception:
+                            continue
+            except Exception as e:
+                logger.debug(f"[US] Dhan candle fetch for {symbol}: {e}")
+
+        if frames:
             df = pd.concat(frames).sort_index()
             df = df[~df.index.duplicated(keep="last")]
             self._candle_cache[symbol] = (time.time(), df)
-            logger.debug(f"[US] {symbol}: Fetched {len(df)} hourly bars")
             return df
 
-        except Exception as e:
-            if self._handle_api_error(f"[US] {symbol} candles", e):
-                return self.get_historical_bars(symbol, days=days)
-            logger.error(f"[US] {symbol}: Historical data error: {e}", exc_info=True)
-            if symbol in self._candle_cache:
-                return self._candle_cache[symbol][1]
-            return None
+        # Fallback to Yahoo Finance (works 24/7 even outside NYSE hours or when Dhan Global unactivated)
+        fallback_df = _fetch_yahoo_candles(symbol)
+        if fallback_df is not None and not fallback_df.empty:
+            self._candle_cache[symbol] = (time.time(), fallback_df)
+            return fallback_df
+
+        if symbol in self._candle_cache:
+            return self._candle_cache[symbol][1]
+
+        logger.warning(f"[US] {symbol}: No market data available from any feed")
+        return None
+
 
     # -----------------------------------------------------------------------
     # Quotes
