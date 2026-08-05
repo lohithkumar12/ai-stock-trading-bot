@@ -454,7 +454,26 @@ class USBroker:
                 chunk_start = chunk_end
 
             if not frames:
-                logger.warning(f"[US] {symbol}: No Dhan candle data")
+                # Try historical_daily_data fallback
+                for segment in ("NSE_FNO", "GLOBAL", "IDX_I"):
+                    try:
+                        resp = self.dhan.historical_daily_data(
+                            security_id=str(sec_id),
+                            exchange_segment=segment,
+                            instrument_type="EQUITY",
+                            from_date=from_date.strftime("%Y-%m-%d"),
+                            to_date=to_date.strftime("%Y-%m-%d"),
+                        )
+                        if self._ok(resp):
+                            part = self._parse_intraday(self._data(resp))
+                            if part is not None and not part.empty:
+                                frames.append(part)
+                                break
+                    except Exception:
+                        continue
+
+            if not frames:
+                logger.warning(f"[US] {symbol}: No Dhan candle data (market closed or symbol unindexed)")
                 if symbol in self._candle_cache:
                     return self._candle_cache[symbol][1]
                 return None
