@@ -162,7 +162,7 @@ class IndiaFnoBroker:
         take_profit: float = 0.0,
     ) -> str | None:
         """Place an option order (paper or live with proper NSE_FNO exchange segment)."""
-        if self.risk_mgr.is_kill_switch_active():
+        if self.risk_mgr.is_kill_switch_active:
             logger.warning("[FNO] Kill switch active — order blocked")
             return None
 
@@ -330,5 +330,5 @@ class IndiaFnoBroker:
             "utilization_pct": round((used / cap) * 100, 2) if cap else 0,
             "cash": cash,
             "positions": len(positions),
-            "kill_switch": self.risk_mgr.is_kill_switch_active(),
+            "kill_switch": self.risk_mgr.is_kill_switch_active,
         }

@@ -77,7 +77,7 @@ class McxBroker:
     ) -> str | None:
         if qty <= 0 or price <= 0:
             return None
-        if self.risk_mgr.is_kill_switch_active():
+        if self.risk_mgr.is_kill_switch_active:
             logger.warning("[MCX] Kill switch active — block")
             return None
 
@@ -187,5 +187,5 @@ class McxBroker:
             "utilization_pct": round((used / cap) * 100, 2) if cap else 0,
             "cash": float(self.paper.cash) if self.paper else None,
             "positions": len(positions),
-            "kill_switch": self.risk_mgr.is_kill_switch_active(),
+            "kill_switch": self.risk_mgr.is_kill_switch_active,
         }

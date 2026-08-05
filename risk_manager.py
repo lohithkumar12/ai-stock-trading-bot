@@ -283,7 +283,7 @@ class RiskManager:
 
     def can_open_position(self, symbol: str, current_positions) -> bool:
         """Alias used by F&O / MCX / Currency brokers."""
-        if self.is_kill_switch_active():
+        if self.is_kill_switch_active:
             logger.warning(f"[{self.market}] Kill switch active — block {symbol}")
             return False
         if isinstance(current_positions, int):
@@ -326,6 +326,7 @@ class RiskManager:
         )
         return False
 
+    @property
     def is_kill_switch_active(self) -> bool:
         return bool(self._kill_switch_active)
 

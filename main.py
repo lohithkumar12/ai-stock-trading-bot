@@ -786,7 +786,7 @@ def run_bot():
                     if is_india_market_open():
                         fno_broker.check_exits()
                         for sym in config.INDIA_FNO_UNIVERSE:
-                            if fno_broker.risk_mgr.is_kill_switch_active():
+                            if fno_broker.risk_mgr.is_kill_switch_active:
                                 logger.warning("[FNO] Kill switch — idle")
                                 break
                             quote = fno_broker.dhan_broker.get_latest_quote(sym)
@@ -855,7 +855,7 @@ def run_bot():
                     if mcx_broker.is_mcx_market_open():
                         mcx_broker.check_exits()
                         for sym in config.MCX_UNIVERSE:
-                            if mcx_broker.risk_mgr.is_kill_switch_active():
+                            if mcx_broker.risk_mgr.is_kill_switch_active:
                                 break
                             quote = mcx_broker.dhan_broker.get_latest_quote(sym)
                             if not quote:
@@ -910,7 +910,7 @@ def run_bot():
                     if currency_broker.is_currency_market_open():
                         currency_broker.check_exits()
                         for sym in config.CURRENCY_UNIVERSE:
-                            if currency_broker.risk_mgr.is_kill_switch_active():
+                            if currency_broker.risk_mgr.is_kill_switch_active:
                                 break
                             quote = currency_broker.dhan_broker.get_latest_quote(sym)
                             if not quote:
