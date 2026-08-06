@@ -19,6 +19,7 @@ Hardening (parity with India feed):
 from __future__ import annotations
 
 import logging
+import struct
 import threading
 import time
 from typing import Any
@@ -26,6 +27,18 @@ from typing import Any
 import config
 
 logger = logging.getLogger(__name__)
+
+# Minimum binary packet sizes (header 11 + body) for Global Stocks feed.
+# SDK process_data uses byte[9] as length; some frames send body-only length
+# (e.g. Trade body=26) which truncates the slice and raises struct.error.
+_GS_PACKET_MIN_LEN = {
+    1: 37,   # Trade
+    3: 27,   # OHLC
+    29: 18,  # Market Status
+    32: 19,  # Previous Close
+    33: 19,  # Circuit Limit
+    36: 19,  # 52 Week High/Low
+}
 
 _feed_instance: "DhanUSLiveFeedManager | None" = None
 _feed_lock = threading.Lock()
@@ -46,6 +59,71 @@ _SEED_SEC_MAP = {
 }
 
 
+def _harden_global_stocks_feed(feed_cls_or_inst) -> None:
+    """
+    Patch GlobalStocksFeed.process_data so short/malformed frames are skipped
+    instead of crashing the recv loop (SDK bug: body-only msg_length).
+    """
+    target = feed_cls_or_inst
+    if getattr(target, "_ns_process_data_hardened", False):
+        return
+
+    def process_data_safe(self, data):
+        if not data:
+            return []
+        if isinstance(data, str):
+            try:
+                data = data.encode("latin-1")
+            except Exception:
+                return []
+        if isinstance(data, memoryview):
+            data = data.tobytes()
+        if not isinstance(data, (bytes, bytearray)):
+            return []
+
+        # Standalone error packet (MsgCode 50 at offset 0)
+        if data[0] == 50:
+            try:
+                return self.process_error(data)
+            except Exception as e:
+                logger.debug(f"[US FEED] error packet parse: {e}")
+                return {"type": "Error", "message": str(e)}
+
+        packets = []
+        offset = 0
+        total = len(data)
+        while offset + 11 <= total:
+            msg_length = int(data[offset + 9])
+            msg_code = int(data[offset + 10])
+            need = _GS_PACKET_MIN_LEN.get(msg_code, max(msg_length, 11))
+            take = msg_length if msg_length >= need else need
+            if take <= 0:
+                break
+            if offset + take > total:
+                # Incomplete frame — stop; next recv may continue
+                break
+            packet = bytes(data[offset : offset + take])
+            try:
+                parsed = self.process_packet(msg_code, packet)
+                if parsed is not None:
+                    packets.append(parsed)
+            except (struct.error, ValueError, TypeError) as pe:
+                logger.debug(
+                    f"[US FEED] skip packet code={msg_code} len={len(packet)} "
+                    f"declared={msg_length}: {pe}"
+                )
+            offset += take
+        if len(packets) == 1:
+            return packets[0]
+        return packets
+
+    # Patch on the class so all instances benefit
+    cls = target if isinstance(target, type) else type(target)
+    cls.process_data = process_data_safe  # type: ignore[method-assign]
+    cls._ns_process_data_hardened = True  # type: ignore[attr-defined]
+    logger.info("[US FEED] Hardened GlobalStocksFeed.process_data (short-packet safe)")
+
+
 def get_us_live_feed_manager() -> "DhanUSLiveFeedManager":
     global _feed_instance
     with _feed_lock:
@@ -59,11 +137,13 @@ def _import_global_stocks_feed():
     try:
         from dhanhq import GlobalStocksFeed
 
+        _harden_global_stocks_feed(GlobalStocksFeed)
         return GlobalStocksFeed
     except ImportError:
         try:
             from dhanhq.global_stocks_feed import GlobalStocksFeed
 
+            _harden_global_stocks_feed(GlobalStocksFeed)
             return GlobalStocksFeed
         except ImportError:
             return None
@@ -367,6 +447,7 @@ class DhanUSLiveFeedManager:
                     break
 
                 logger.info("[US FEED] GlobalStocksFeed connected — receiving ticks")
+                consecutive_parse_errors = 0
                 while not self._stop:
                     with self._lock:
                         if time.time() < self._rate_limited_until:
@@ -374,15 +455,51 @@ class DhanUSLiveFeedManager:
                             break
                     try:
                         data = self._ws_feed.get_data()
+                        consecutive_parse_errors = 0
                         self._on_ticks_callback(self._ws_feed, data)
+                    except (struct.error, ValueError) as parse_err:
+                        # Malformed frame — keep socket; do not reconnect storm
+                        consecutive_parse_errors += 1
+                        if consecutive_parse_errors <= 3 or consecutive_parse_errors % 50 == 0:
+                            logger.warning(
+                                f"[US FEED] Skipping malformed packet "
+                                f"({consecutive_parse_errors}x): {parse_err}"
+                            )
+                        if consecutive_parse_errors > 200:
+                            logger.warning(
+                                "[US FEED] Too many malformed packets — reconnecting"
+                            )
+                            break
+                        continue
                     except Exception as recv_err:
                         if self._is_rate_limit_error(recv_err):
                             was_rate_limited = True
                             raise
+                        err_l = str(recv_err).lower()
+                        # Connection truly dead
+                        if any(
+                            k in err_l
+                            for k in (
+                                "closed",
+                                "disconnect",
+                                "1000",
+                                "1001",
+                                "1006",
+                                "no close frame",
+                                "connection reset",
+                            )
+                        ):
+                            logger.warning(
+                                f"[US FEED] GlobalStocksFeed recv ended: {recv_err}"
+                            )
+                            break
+                        consecutive_parse_errors += 1
                         logger.warning(
-                            f"[US FEED] GlobalStocksFeed recv ended: {recv_err}"
+                            f"[US FEED] GlobalStocksFeed recv note: {recv_err}"
                         )
-                        break
+                        if consecutive_parse_errors > 20:
+                            break
+                        continue
 
                 had_ticks = self._last_heartbeat > hb_before
                 if had_ticks:
@@ -482,9 +599,8 @@ class DhanUSLiveFeedManager:
                 return True
 
         try:
-            from us_instruments import get_us_security_id, load_us_scrip_master
+            from us_instruments import get_us_security_id
 
-            load_us_scrip_master()
             sec_id = get_us_security_id(symbol)
             if not sec_id:
                 logger.warning(f"[US FEED] Skip subscribe {symbol}: no security_id")

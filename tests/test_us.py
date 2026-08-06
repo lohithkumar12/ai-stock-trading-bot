@@ -182,6 +182,35 @@ class TestUSLiveFeed(unittest.TestCase):
         self.assertIsNotNone(q)
         self.assertAlmostEqual(q["ltp"], 188.40)
 
+    def test_harden_process_data_accepts_body_only_length(self):
+        from dhan_us_live_feed import _harden_global_stocks_feed, _import_global_stocks_feed
+        import struct
+
+        GlobalStocksFeed = _import_global_stocks_feed()
+        if GlobalStocksFeed is None:
+            self.skipTest("GlobalStocksFeed not installed")
+        _harden_global_stocks_feed(GlobalStocksFeed)
+
+        # Synthetic Trade frame: header(11) + body(26)=37, but byte[9] lies as 26
+        # (the bug that crashed the live socket on the VM).
+        header = bytearray(11)
+        header[0] = 1  # exch
+        struct.pack_into("<i", header, 1, 10000025)  # scrip id
+        header[9] = 26  # body-only length (BUG)
+        header[10] = 1  # Trade
+        body = struct.pack(
+            "<fhifiii", 190.5, 1, 1000, 190.0, 0, 1_700_000_000, 1_700_000_000
+        )
+        frame = bytes(header) + body
+        self.assertEqual(len(frame), 37)
+
+        feed = GlobalStocksFeed.__new__(GlobalStocksFeed)
+        parsed = GlobalStocksFeed.process_data(feed, frame)
+        self.assertIsInstance(parsed, dict)
+        self.assertEqual(parsed.get("type"), "Trade")
+        self.assertEqual(int(parsed.get("security_id")), 10000025)
+        self.assertAlmostEqual(float(parsed.get("LTP")), 190.5, places=1)
+
 
 class TestUSDashboardRoutes(unittest.TestCase):
     def setUp(self):

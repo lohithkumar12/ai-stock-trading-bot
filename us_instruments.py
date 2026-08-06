@@ -25,6 +25,7 @@ US_SCRIP_MASTER_URL = (
     "https://api-global-stocks.dhan.co/api-data/us-stock-scrip-master.csv"
 )
 CACHE_TTL_SEC = 6 * 3600  # 6 hours
+FETCH_FAIL_COOLDOWN_SEC = 3600  # don't hammer CDN after 403
 
 # ---------------------------------------------------------------------------
 # Default US Universe — SCRIP_CODE from official Global Stocks master
@@ -86,11 +87,52 @@ _master_lock = threading.Lock()
 _master_by_symbol: dict[str, dict] = {}
 _last_download_time = 0.0
 _master_row_count = 0
+_fetch_failed_until = 0.0
+_last_fetch_error = ""
+
+
+def _download_scrip_csv() -> str:
+    """Fetch CSV text; try requests then urllib. Raises on failure."""
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/csv,text/plain,*/*",
+    }
+    try:
+        import config
+
+        token = (getattr(config, "DHAN_ACCESS_TOKEN", None) or "").strip()
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+            headers["access-token"] = token
+        cid = (getattr(config, "DHAN_CLIENT_ID", None) or "").strip()
+        if cid:
+            headers["client-id"] = cid
+    except Exception:
+        pass
+
+    try:
+        import requests
+
+        resp = requests.get(US_SCRIP_MASTER_URL, headers=headers, timeout=45)
+        if resp.status_code == 200 and resp.text and "SCRIP_CODE" in resp.text[:500]:
+            return resp.text
+        raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:120]}")
+    except Exception as req_err:
+        req = urllib.request.Request(US_SCRIP_MASTER_URL, headers=headers)
+        with urllib.request.urlopen(req, timeout=45) as resp:
+            content = resp.read().decode("utf-8", errors="ignore")
+        if "SCRIP_CODE" not in content[:500]:
+            raise RuntimeError(f"unexpected CSV after urllib fallback ({req_err})")
+        return content
 
 
 def load_us_scrip_master(force_download: bool = False) -> bool:
     """Download and index the official US Global Stocks scrip master CSV."""
     global _last_download_time, _master_by_symbol, _master_row_count
+    global _fetch_failed_until, _last_fetch_error
     with _master_lock:
         now = time.time()
         if (
@@ -99,15 +141,15 @@ def load_us_scrip_master(force_download: bool = False) -> bool:
             and (now - _last_download_time < CACHE_TTL_SEC)
         ):
             return True
+        if not force_download and now < _fetch_failed_until:
+            # Seed map remains usable; avoid 403 spam from GCP/CDN blocks
+            return bool(_master_by_symbol)
 
         try:
-            logger.info(f"[US] Fetching Global Stocks scrip master from {US_SCRIP_MASTER_URL}...")
-            req = urllib.request.Request(
-                US_SCRIP_MASTER_URL,
-                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+            logger.info(
+                f"[US] Fetching Global Stocks scrip master from {US_SCRIP_MASTER_URL}..."
             )
-            with urllib.request.urlopen(req, timeout=45) as resp:
-                content = resp.read().decode("utf-8", errors="ignore")
+            content = _download_scrip_csv()
 
             reader = csv.DictReader(io.StringIO(content))
             by_symbol: dict[str, dict] = {}
@@ -140,7 +182,8 @@ def load_us_scrip_master(force_download: bool = False) -> bool:
                 _master_by_symbol = by_symbol
                 _master_row_count = count
                 _last_download_time = now
-                # Align static seed map with fresh SCRIP_CODEs
+                _fetch_failed_until = 0.0
+                _last_fetch_error = ""
                 for ticker, info in US_INSTRUMENTS.items():
                     master = by_symbol.get(ticker)
                     if master and master.get("security_id"):
@@ -154,9 +197,15 @@ def load_us_scrip_master(force_download: bool = False) -> bool:
                 return True
 
             logger.warning("[US] Global scrip master download returned no symbols")
+            _fetch_failed_until = now + FETCH_FAIL_COOLDOWN_SEC
             return False
         except Exception as e:
-            logger.warning(f"[US] Global scrip master fetch failed: {e}")
+            _last_fetch_error = str(e)
+            _fetch_failed_until = now + FETCH_FAIL_COOLDOWN_SEC
+            logger.warning(
+                f"[US] Global scrip master fetch failed: {e} — "
+                f"using seeded SCRIP_CODEs for {FETCH_FAIL_COOLDOWN_SEC}s"
+            )
             return bool(_master_by_symbol)
 
 
@@ -173,6 +222,13 @@ def master_status() -> dict:
             "row_count": _master_row_count,
             "age_sec": age,
             "url": US_SCRIP_MASTER_URL,
+            "using_seed": not bool(_master_by_symbol),
+            "last_error": _last_fetch_error or None,
+            "cooldown_sec": (
+                round(max(0.0, _fetch_failed_until - time.time()), 1)
+                if _fetch_failed_until > time.time()
+                else 0
+            ),
         }
 
 
