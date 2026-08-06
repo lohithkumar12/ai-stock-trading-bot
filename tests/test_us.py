@@ -195,25 +195,36 @@ class TestUSLiveFeed(unittest.TestCase):
             self.skipTest("GlobalStocksFeed not installed")
         _harden_global_stocks_feed(GlobalStocksFeed)
 
-        # Synthetic Trade frame: header(11) + body(26)=37, but byte[9] lies as 26
-        # (the bug that crashed the live socket on the VM).
+        # Live wire Trade: total len byte=27 (not SDK's 37)
         header = bytearray(11)
-        header[0] = 1  # exch
-        struct.pack_into("<i", header, 1, 10000025)  # scrip id
-        header[9] = 26  # body-only length (BUG)
+        header[0] = 14  # INX exch
+        struct.pack_into("<i", header, 1, 10000025)
+        struct.pack_into("<i", header, 5, 10000025)
+        header[9] = 27
         header[10] = 1  # Trade
-        body = struct.pack(
-            "<fhifiii", 190.5, 1, 1000, 190.0, 0, 1_700_000_000, 1_700_000_000
-        )
+        body = struct.pack("<fiii", 309.72, 100, 1_700_000_000, 1_700_000_001)
         frame = bytes(header) + body
-        self.assertEqual(len(frame), 37)
+        self.assertEqual(len(frame), 27)
 
         feed = GlobalStocksFeed.__new__(GlobalStocksFeed)
         parsed = GlobalStocksFeed.process_data(feed, frame)
         self.assertIsInstance(parsed, dict)
         self.assertEqual(parsed.get("type"), "Trade")
         self.assertEqual(int(parsed.get("security_id")), 10000025)
-        self.assertAlmostEqual(float(parsed.get("LTP")), 190.5, places=1)
+        self.assertAlmostEqual(float(parsed.get("LTP")), 309.72, places=1)
+
+        # Live wire Previous Close: total len=15
+        pc = bytearray(15)
+        pc[0] = 14
+        struct.pack_into("<i", pc, 1, 10000025)
+        struct.pack_into("<i", pc, 5, 10000025)
+        pc[9] = 15
+        pc[10] = 32
+        struct.pack_into("<f", pc, 11, 311.0)
+        parsed_pc = GlobalStocksFeed.process_data(feed, bytes(pc))
+        self.assertIsInstance(parsed_pc, dict)
+        self.assertEqual(parsed_pc.get("type"), "Previous Close")
+        self.assertAlmostEqual(float(parsed_pc.get("prev_close")), 311.0, places=1)
 
 
 class TestUSDashboardRoutes(unittest.TestCase):

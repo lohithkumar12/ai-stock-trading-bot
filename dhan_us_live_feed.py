@@ -28,14 +28,13 @@ import config
 
 logger = logging.getLogger(__name__)
 
-# Minimum binary packet sizes (header 11 + body) for Global Stocks feed.
-# SDK process_data uses byte[9] as length; some frames send body-only length
-# (e.g. Trade body=26) which truncates the slice and raises struct.error.
+# Wire sizes observed from global-stocks-api-feed (byte[9] = TOTAL packet length).
+# SDK docs claimed Trade=37 / PrevClose=19; live feed sends Trade=27 / PrevClose=15.
 _GS_PACKET_MIN_LEN = {
-    1: 37,   # Trade
+    1: 27,   # Trade (header 11 + LTP/qty/times)
     3: 27,   # OHLC
     29: 18,  # Market Status
-    32: 19,  # Previous Close
+    32: 15,  # Previous Close (header 11 + one float32)
     33: 19,  # Circuit Limit
     36: 19,  # 52 Week High/Low
 }
@@ -119,7 +118,7 @@ def _parse_india_compatible_packet(first: int, data: bytes) -> dict | None:
 
 
 def _parse_trade_partial(feed_self, packet: bytes) -> dict | None:
-    """Best-effort Trade parse when declared length is short (SDK/server mismatch)."""
+    """Trade parse for live 27-byte frames (SDK's 37-byte layout is wrong on wire)."""
     if len(packet) >= 37:
         try:
             return feed_self.process_trade(packet)
@@ -128,10 +127,7 @@ def _parse_trade_partial(feed_self, packet: bytes) -> dict | None:
     if len(packet) < 15:
         return None
     try:
-        if len(packet) >= 11:
-            exch_seg, scrip_id = feed_self._parse_header(packet)
-        else:
-            return None
+        exch_seg, scrip_id = feed_self._parse_header(packet)
         ltp = struct.unpack("<f", packet[11:15])[0]
         if not (0 < ltp < 1_000_000):
             return None
@@ -141,11 +137,39 @@ def _parse_trade_partial(feed_self, packet: bytes) -> dict | None:
             "security_id": scrip_id,
             "LTP": "{:.2f}".format(ltp),
         }
-        if len(packet) >= 17:
-            out["LTQ"] = struct.unpack("<h", packet[15:17])[0]
-        if len(packet) >= 21:
-            out["volume"] = struct.unpack("<i", packet[17:21])[0]
+        # Live Trade body after LTP appears as int32 fields (qty / epochs)
+        if len(packet) >= 19:
+            out["LTQ"] = struct.unpack("<i", packet[15:19])[0]
+        if len(packet) >= 23:
+            out["LTT"] = struct.unpack("<i", packet[19:23])[0]
+        if len(packet) >= 27:
+            out["LUT"] = struct.unpack("<i", packet[23:27])[0]
         return out
+    except (struct.error, ValueError, TypeError):
+        return None
+
+
+def _parse_prev_close_partial(feed_self, packet: bytes) -> dict | None:
+    """Previous Close is 15 bytes on wire (one float), not SDK's 19."""
+    if len(packet) >= 19:
+        try:
+            return feed_self.process_prev_close(packet)
+        except Exception:
+            pass
+    if len(packet) < 15:
+        return None
+    try:
+        exch_seg, scrip_id = feed_self._parse_header(packet)
+        prev_close = struct.unpack("<f", packet[11:15])[0]
+        if not (0 < prev_close < 1_000_000):
+            return None
+        return {
+            "type": "Previous Close",
+            "exchange_segment": exch_seg,
+            "security_id": scrip_id,
+            "prev_close": prev_close,
+            "prev_OI": 0,
+        }
     except (struct.error, ValueError, TypeError):
         return None
 
@@ -200,10 +224,14 @@ def _harden_global_stocks_feed(feed_cls_or_inst) -> None:
                 break
 
             if offset + take > total:
-                # Incomplete vs declared — try partial Trade on remainder
+                # Incomplete vs declared — try partial parsers on remainder
                 rem = bytes(data[offset:total])
                 if msg_code == 1:
                     partial = _parse_trade_partial(self, rem)
+                    if partial is not None:
+                        packets.append(partial)
+                elif msg_code == 32:
+                    partial = _parse_prev_close_partial(self, rem)
                     if partial is not None:
                         packets.append(partial)
                 elif msg_code in _GS_PACKET_MIN_LEN and len(rem) >= 11:
@@ -217,7 +245,12 @@ def _harden_global_stocks_feed(feed_cls_or_inst) -> None:
 
             packet = bytes(data[offset : offset + take])
             try:
-                parsed = self.process_packet(msg_code, packet)
+                if msg_code == 1 and len(packet) < 37:
+                    parsed = _parse_trade_partial(self, packet)
+                elif msg_code == 32 and len(packet) < 19:
+                    parsed = _parse_prev_close_partial(self, packet)
+                else:
+                    parsed = self.process_packet(msg_code, packet)
                 if parsed is not None:
                     packets.append(parsed)
             except (struct.error, ValueError, TypeError) as pe:
@@ -230,6 +263,10 @@ def _harden_global_stocks_feed(feed_cls_or_inst) -> None:
                             f"[US FEED] skip packet code={msg_code} len={len(packet)} "
                             f"declared={msg_length}: {pe}"
                         )
+                elif msg_code == 32:
+                    partial = _parse_prev_close_partial(self, packet)
+                    if partial is not None:
+                        packets.append(partial)
                 else:
                     logger.debug(
                         f"[US FEED] skip packet code={msg_code} len={len(packet)} "
@@ -429,7 +466,7 @@ class DhanUSLiveFeedManager:
             self._diag_frames += 1
             frame_n = self._diag_frames
 
-        if frame_n <= 25:
+        if frame_n <= 8:
             summary = data
             if isinstance(data, list):
                 summary = f"list[{len(data)}] types={[ (x.get('type') if isinstance(x, dict) else type(x).__name__) for x in data[:5] ]}"
@@ -441,10 +478,10 @@ class DhanUSLiveFeedManager:
             elif data in ([], "", None):
                 summary = f"empty({data!r})"
             logger.info(f"[US FEED] frame#{frame_n}: {summary}")
+        elif frame_n == 9:
+            logger.info("[US FEED] Tick stream healthy — further frame dumps at DEBUG")
 
         if isinstance(data, list):
-            if not data and frame_n <= 10:
-                logger.info("[US FEED] empty parse result — binary layout may not match SDK")
             for item in data:
                 self._on_tick(item)
         else:
@@ -609,7 +646,7 @@ class DhanUSLiveFeedManager:
                         raw = await self._ws_feed.ws.recv()
                         with self._lock:
                             n = self._diag_frames
-                        if n < 15:
+                        if n < 8:
                             raw_b = raw if isinstance(raw, (bytes, bytearray)) else str(raw)[:80]
                             if isinstance(raw_b, (bytes, bytearray)):
                                 logger.info(
