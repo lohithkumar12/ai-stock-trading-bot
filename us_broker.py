@@ -30,6 +30,7 @@ from us_instruments import (
     get_us_security_id,
     get_us_exchange,
     is_us_symbol,
+    load_us_scrip_master,
 )
 from us_paper import USPaperPortfolio
 
@@ -134,8 +135,28 @@ class USBroker:
         mode = "PAPER SIM (live US data, fake USD)" if self.paper else "LIVE REAL MONEY"
         logger.info(f"[US] USBroker mode: {mode}")
 
+        # Align SCRIP_CODEs from official Global Stocks master (best-effort)
+        try:
+            load_us_scrip_master()
+        except Exception as me:
+            logger.debug(f"[US] Scrip master preload note: {me}")
+
         if auto_login:
             self.login()
+
+    def _sync_us_live_feed_credentials(self, reconnect: bool = True) -> None:
+        """Push latest access token into the GlobalStocksFeed manager."""
+        if not getattr(config, "DHAN_US_LIVE_WEBSOCKET", False):
+            return
+        try:
+            from dhan_us_live_feed import get_us_live_feed_manager
+
+            feed = get_us_live_feed_manager()
+            feed.update_credentials(
+                self.client_id, self.access_token, reconnect=reconnect
+            )
+        except Exception as e:
+            logger.debug(f"[US] Live feed credential sync note: {e}")
 
     # -----------------------------------------------------------------------
     # Authentication (reuses Dhan credentials — same as India)
@@ -183,6 +204,7 @@ class USBroker:
                     return False
 
                 token = self.access_token
+                prev_token = token
                 need_refresh = not token
                 if self._session_time and token:
                     age = datetime.now() - self._session_time
@@ -228,16 +250,19 @@ class USBroker:
                                 refreshed = self._refresh_access_token()
                                 if refreshed:
                                     self.access_token = refreshed
+                                    token = refreshed
                                     self.dhan = self._build_client(refreshed)
                 except Exception as ge:
                     logger.warning(f"[US] Global fund limit probe: {ge} (may not be activated)")
                     self._global_stocks_available = False
 
+                self.access_token = token
                 self._session_time = datetime.now()
                 self._logged_in = True
                 if self._global_stocks_available:
                     self.last_error = ""
                 logger.info(f"[US] Dhan LOGIN SUCCESS | Client: {self.client_id} | Global={self._global_stocks_available}")
+                self._sync_us_live_feed_credentials(reconnect=(token != prev_token))
                 return True
 
             except Exception as e:
@@ -576,28 +601,49 @@ class USBroker:
         if cached:
             return cached
 
+        # 1) GlobalStocksFeed WebSocket cache (preferred when live)
+        try:
+            from dhan_us_live_feed import get_us_live_feed_manager
+
+            ws_quote = get_us_live_feed_manager().get_live_quote(symbol)
+            if ws_quote and float(ws_quote.get("ltp") or 0) > 0:
+                return self._cache_quote(symbol, {
+                    "ltp": float(ws_quote["ltp"]),
+                    "ask_price": float(ws_quote.get("ask_price") or ws_quote["ltp"]),
+                    "symbol": symbol,
+                    "exchange": "GLOBAL",
+                    "source": "websocket_live",
+                    "open": ws_quote.get("open"),
+                    "high": ws_quote.get("high"),
+                    "low": ws_quote.get("low"),
+                    "close": ws_quote.get("close"),
+                    "volume": ws_quote.get("volume"),
+                })
+        except Exception as fe:
+            logger.debug(f"[US] Live feed quote skip: {fe}")
+
         if time.time() < self._marketfeed_cooldown_until:
             return self._quote_from_candle_cache(symbol)
 
         self.ensure_session()
         if not self.dhan:
-            return self._quote_from_candle_cache(symbol)
+            return self._yahoo_quote_fallback(symbol)
 
         sec_id = get_us_security_id(symbol)
         if not sec_id:
             logger.error(f"[US] No security_id for {symbol}")
-            return self._quote_from_candle_cache(symbol)
+            return self._yahoo_quote_fallback(symbol)
 
-        # Try ticker_data with Global segment
+        # 2) Dhan Global REST ticker_data / ohlc_data
         try:
             method = getattr(self.dhan, "ticker_data", None) or getattr(
                 self.dhan, "ohlc_data", None
             )
             if method is None:
-                return self._quote_from_candle_cache(symbol)
+                return self._yahoo_quote_fallback(symbol)
 
             # Try different segment keys for Global Stocks
-            for segment_key in ("GLOBAL", "NSE_FNO", "IDX_I"):
+            for segment_key in ("GLOBAL", "INX_EQ", "NSE_FNO", "IDX_I"):
                 try:
                     securities = {segment_key: [int(sec_id)]}
                     resp = method(securities)
@@ -630,18 +676,43 @@ class USBroker:
                 except Exception:
                     continue
 
-            # All segment keys failed
-            return self._quote_from_candle_cache(symbol)
+            # 3) Yahoo / candle last resort
+            return self._yahoo_quote_fallback(symbol)
 
         except Exception as e:
             msg = str(e).lower()
             if "429" in msg or "rate" in msg:
                 self._arm_marketfeed_cooldown("[US] exception 429")
-                return self._quote_from_candle_cache(symbol)
+                return self._yahoo_quote_fallback(symbol)
             if self._handle_api_error(f"[US] {symbol} LTP", e):
                 return self.get_latest_quote(symbol)
             logger.error(f"[US] {symbol}: LTP error: {e}", exc_info=True)
-            return self._quote_from_candle_cache(symbol)
+            return self._yahoo_quote_fallback(symbol)
+
+    def _yahoo_quote_fallback(self, symbol: str) -> dict | None:
+        """Last-resort quote: candle cache, then Yahoo daily chart close."""
+        from_candle = self._quote_from_candle_cache(symbol)
+        if from_candle:
+            return from_candle
+
+        df = _fetch_yahoo_candles(symbol)
+        if df is None or df.empty or "close" not in df.columns:
+            return None
+        close = float(df["close"].iloc[-1])
+        if close <= 0:
+            return None
+        self._candle_cache[symbol] = (time.time(), df)
+        self._quote_warn(
+            symbol,
+            f"[US] {symbol}: using Yahoo last-resort LTP ${close:.2f}",
+        )
+        return self._cache_quote(symbol, {
+            "ltp": close,
+            "ask_price": close,
+            "symbol": symbol,
+            "exchange": "GLOBAL",
+            "source": "yahoo",
+        })
 
     # -----------------------------------------------------------------------
     # Live gate

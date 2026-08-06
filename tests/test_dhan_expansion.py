@@ -215,6 +215,12 @@ class TestDhanExpansionProductionSuite(unittest.TestCase):
         feed = data["dhan_live_feed"]
         for key in ("enabled", "connected", "cached_symbols_count", "subscribed_count"):
             self.assertIn(key, feed)
+        self.assertIn("dhan_us_live_feed", data)
+        us_feed = data["dhan_us_live_feed"]
+        for key in ("enabled", "connected", "mode", "subscribed_count"):
+            self.assertIn(key, us_feed)
+        self.assertIn("us_global", data["segments"])
+        self.assertIn("live_feed", data["segments"]["us_global"])
 
     def test_price_guards_reject_fake_mcx_and_fallback(self):
         """Fake Rs1500 MCX marks and paper_fallback quotes must be rejected."""

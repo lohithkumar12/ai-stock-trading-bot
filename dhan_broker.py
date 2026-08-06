@@ -162,16 +162,25 @@ class DhanBroker:
             logger.debug(f"[AUTH] Token cache write skip: {e}")
 
     def _sync_live_feed_credentials(self, reconnect: bool = True) -> None:
-        """Push latest access token into the paid Data API WebSocket feed."""
-        if not config.DHAN_LIVE_WEBSOCKET:
-            return
-        try:
-            feed = get_live_feed_manager()
-            feed.update_credentials(
-                self.client_id, self.access_token, reconnect=reconnect
-            )
-        except Exception as e:
-            logger.debug(f"[AUTH] Live feed credential sync note: {e}")
+        """Push latest access token into India + US live WebSocket feeds."""
+        if config.DHAN_LIVE_WEBSOCKET:
+            try:
+                feed = get_live_feed_manager()
+                feed.update_credentials(
+                    self.client_id, self.access_token, reconnect=reconnect
+                )
+            except Exception as e:
+                logger.debug(f"[AUTH] Live feed credential sync note: {e}")
+        if getattr(config, "DHAN_US_LIVE_WEBSOCKET", False):
+            try:
+                from dhan_us_live_feed import get_us_live_feed_manager
+
+                us_feed = get_us_live_feed_manager()
+                us_feed.update_credentials(
+                    self.client_id, self.access_token, reconnect=reconnect
+                )
+            except Exception as e:
+                logger.debug(f"[AUTH] US live feed credential sync note: {e}")
 
     def _build_client(self, access_token: str) -> dhanhq:
         ctx = DhanContext(self.client_id, access_token)

@@ -96,8 +96,14 @@ INDIA_ENABLED: bool = (
 # Product Type: CNC (Equity Delivery), INTRADAY (MIS), MTF (Margin Trading Facility)
 INDIA_PRODUCT_TYPE: str = os.getenv("INDIA_PRODUCT_TYPE", "CNC").strip().upper()
 
-# Dhan Paid Data API Live Feed / WebSocket Toggle
+# Dhan Paid Data API Live Feed / WebSocket Toggle (India NSE/MCX/FX MarketFeed)
 DHAN_LIVE_WEBSOCKET: bool = _env_bool("DHAN_LIVE_WEBSOCKET", "true") if DHAN_CONFIGURED else False
+
+# Dhan Global Stocks Live Feed (US equities via GlobalStocksFeed / INX_EQ)
+# Separate socket from India MarketFeed; requires Global Stocks activated + dhanhq>=2.3.0rc1
+DHAN_US_LIVE_WEBSOCKET: bool = (
+    _env_bool("DHAN_US_LIVE_WEBSOCKET", "true") if DHAN_CONFIGURED else False
+)
 
 INDIA_STOCK_UNIVERSE: list[str] = [
     "RELIANCE",

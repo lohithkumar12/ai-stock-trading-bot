@@ -546,7 +546,7 @@ class DhanLiveFeedManager:
                 "order_updates_received": len(self._order_updates),
                 "reconnect_attempts": self._reconnect_attempts,
                 "us_feed_note": (
-                    "US Global symbols use REST/Yahoo fallback — "
-                    "Dhan MarketFeed is India/MCX segments only"
+                    "US Global uses separate GlobalStocksFeed "
+                    "(see dhan_us_live_feed / DHAN_US_LIVE_WEBSOCKET)"
                 ),
             }

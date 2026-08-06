@@ -721,16 +721,45 @@ def run_bot():
                 n += feed_mgr.subscribe_universe(config.MCX_UNIVERSE, "MCX_COMM")
             if config.CURRENCY_ENABLED:
                 n += feed_mgr.subscribe_universe(config.CURRENCY_UNIVERSE, "NSE_CURRENCY")
-            # US Global: MarketFeed is India/MCX only — REST/Yahoo fallback documented in status
             logger.info(
-                f"[FEED] Subscribed {n} instruments across enabled universes "
-                f"(US uses REST/Yahoo fallback) | feed_enabled={feed_mgr.enabled} "
-                f"connected={feed_mgr.is_connected()}"
+                f"[FEED] Subscribed {n} India/MCX/FX instruments | "
+                f"feed_enabled={feed_mgr.enabled} connected={feed_mgr.is_connected()}"
             )
         else:
-            logger.info("[FEED] Live WebSocket disabled — REST quote mode")
+            logger.info("[FEED] India Live WebSocket disabled — REST quote mode")
     except Exception as fe:
         logger.warning(f"[FEED] Universe live feed subscription warning: {fe}")
+
+    # US Global Stocks live feed (separate GlobalStocksFeed socket)
+    if config.US_ENABLED and getattr(config, "DHAN_US_LIVE_WEBSOCKET", False):
+        try:
+            from dhan_us_live_feed import get_us_live_feed_manager
+            from us_instruments import load_us_scrip_master
+
+            load_us_scrip_master()
+            us_feed = get_us_live_feed_manager()
+            # Prefer credentials already refreshed by India Dhan login
+            if config.DHAN_CONFIGURED:
+                try:
+                    from india_client import get_shared_india_broker
+
+                    india_auth = get_shared_india_broker(auto_login=False)
+                    if getattr(india_auth, "access_token", None):
+                        us_feed.update_credentials(
+                            india_auth.client_id,
+                            india_auth.access_token,
+                            reconnect=False,
+                        )
+                except Exception:
+                    pass
+            n_us = us_feed.subscribe_universe(config.US_STOCK_UNIVERSE)
+            logger.info(
+                f"[US FEED] Subscribed {n_us}/{len(config.US_STOCK_UNIVERSE)} "
+                f"US symbols via GlobalStocksFeed | enabled={us_feed.enabled} "
+                f"connected={us_feed.is_connected()} mode={us_feed.status_summary().get('mode')}"
+            )
+        except Exception as ufe:
+            logger.warning(f"[US FEED] Universe subscription warning: {ufe}")
 
     try:
         dash_port = int(os.environ.get("PORT", 5000))

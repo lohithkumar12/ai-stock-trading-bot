@@ -2,12 +2,16 @@
 tests/test_us.py — Smoke & Integration Tests for US Trading Stack
 """
 
-import os
 import unittest
 from unittest.mock import MagicMock, patch
 
 import config
-from us_instruments import get_us_security_id, is_us_symbol, get_all_us_symbols
+from us_instruments import (
+    get_us_security_id,
+    is_us_symbol,
+    get_all_us_symbols,
+    US_INSTRUMENTS,
+)
 from us_paper import USPaperPortfolio
 from us_broker import USBroker
 from dashboard_server import app
@@ -20,6 +24,13 @@ class TestUSInstruments(unittest.TestCase):
         self.assertIn("NVDA", symbols)
         self.assertTrue(is_us_symbol("AAPL"))
         self.assertIsNotNone(get_us_security_id("AAPL"))
+
+    def test_security_ids_are_global_scrip_codes(self):
+        """SCRIP_CODEs from official master are 8-digit (1xxxxxxx), not stale 199xx."""
+        aapl = get_us_security_id("AAPL")
+        self.assertTrue(str(aapl).isdigit())
+        self.assertGreaterEqual(int(aapl), 10_000_000)
+        self.assertEqual(US_INSTRUMENTS["AAPL"]["security_id"], aapl)
 
 
 class TestUSPaperPortfolio(unittest.TestCase):
@@ -71,6 +82,107 @@ class TestUSBrokerSafety(unittest.TestCase):
             self.assertIn("Live trading not confirmed", broker.last_error)
 
 
+class TestUSLiveFeed(unittest.TestCase):
+    def test_feed_connected_only_after_tick(self):
+        from dhan_us_live_feed import DhanUSLiveFeedManager
+
+        with patch.object(config, "DHAN_US_LIVE_WEBSOCKET", True), \
+             patch.object(config, "DHAN_CLIENT_ID", "111"), \
+             patch.object(config, "DHAN_ACCESS_TOKEN", "tok"), \
+             patch.object(DhanUSLiveFeedManager, "_start_threads"):
+            feed = DhanUSLiveFeedManager()
+            feed.enabled = True
+            feed._sdk_available = True
+            feed._last_heartbeat = 0.0
+            feed._is_connected = False
+            self.assertFalse(feed.is_connected())
+
+            feed.update_quote("AAPL", 190.5)
+            self.assertTrue(feed.is_connected())
+            q = feed.get_live_quote("AAPL")
+            self.assertIsNotNone(q)
+            self.assertEqual(q["ltp"], 190.5)
+            self.assertEqual(q["source"], "websocket_live")
+
+            summary = feed.status_summary()
+            self.assertEqual(summary["mode"], "websocket_live")
+            self.assertEqual(summary["feed"], "GlobalStocksFeed")
+
+            feed.update_credentials("111", "fresh-token", reconnect=False)
+            self.assertEqual(feed.access_token, "fresh-token")
+
+    def test_subscribe_builds_inx_eq_tuple(self):
+        from dhan_us_live_feed import DhanUSLiveFeedManager
+
+        feed = DhanUSLiveFeedManager.__new__(DhanUSLiveFeedManager)
+        feed.enabled = True
+        feed._sdk_available = True
+        feed._subscribed_symbols = set()
+        feed._instrument_tuples = []
+        feed._sec_id_to_symbol = {}
+        feed._quote_cache = {}
+        feed._lock = __import__("threading").Lock()
+        feed._ws_feed = MagicMock()
+        feed._ws_feed.subscribe_symbols = MagicMock()
+
+        with patch("us_instruments.get_us_security_id", return_value="10000025"), \
+             patch("us_instruments.load_us_scrip_master", return_value=True), \
+             patch("dhan_us_live_feed._import_global_stocks_feed") as mock_gsf:
+            mock_cls = MagicMock()
+            mock_cls.INX_EQ = "INX_EQ"
+            mock_cls.SubscribeTrade = 15
+            mock_gsf.return_value = mock_cls
+            ok = feed.subscribe_symbol("AAPL")
+        self.assertTrue(ok)
+        self.assertIn("AAPL", feed._subscribed_symbols)
+        feed._ws_feed.subscribe_symbols.assert_called()
+        args = feed._ws_feed.subscribe_symbols.call_args[0][0]
+        self.assertEqual(args[0][0], "INX_EQ")
+        self.assertEqual(str(args[0][1]), "10000025")
+
+    def test_429_sets_rate_limit_cool_down(self):
+        from dhan_us_live_feed import DhanUSLiveFeedManager
+
+        self.assertTrue(DhanUSLiveFeedManager._is_rate_limit_error("HTTP 429 Too Many Requests"))
+        self.assertTrue(DhanUSLiveFeedManager._is_rate_limit_error("Connection limit exceeded"))
+        self.assertFalse(DhanUSLiveFeedManager._is_rate_limit_error("token expired"))
+
+    def test_get_latest_quote_prefers_websocket(self):
+        broker = USBroker(auto_login=False)
+        broker._quote_cache.clear()
+        mock_feed = MagicMock()
+        mock_feed.get_live_quote.return_value = {
+            "ltp": 201.25,
+            "source": "websocket_live",
+            "symbol": "AAPL",
+        }
+        with patch("dhan_us_live_feed.get_us_live_feed_manager", return_value=mock_feed):
+            q = broker.get_latest_quote("AAPL")
+        self.assertIsNotNone(q)
+        self.assertEqual(q["ltp"], 201.25)
+        self.assertEqual(q["source"], "websocket_live")
+        mock_feed.get_live_quote.assert_called_with("AAPL")
+
+    def test_on_tick_parses_trade_string_ltp(self):
+        from dhan_us_live_feed import DhanUSLiveFeedManager
+
+        feed = DhanUSLiveFeedManager.__new__(DhanUSLiveFeedManager)
+        feed._sec_id_to_symbol = {"10000025": "AAPL"}
+        feed._quote_cache = {}
+        feed._lock = __import__("threading").Lock()
+        feed._last_heartbeat = 0.0
+        feed._is_connected = False
+        feed._on_tick({
+            "type": "Trade",
+            "security_id": 10000025,
+            "LTP": "188.40",
+            "volume": 100,
+        })
+        q = feed.get_live_quote("AAPL")
+        self.assertIsNotNone(q)
+        self.assertAlmostEqual(q["ltp"], 188.40)
+
+
 class TestUSDashboardRoutes(unittest.TestCase):
     def setUp(self):
         self.client = app.test_client()
@@ -99,6 +211,13 @@ class TestUSDashboardRoutes(unittest.TestCase):
         data = res.get_json()
         self.assertIn("us_enabled", data)
         self.assertIn("us_kill_switch", data)
+
+    def test_segments_status_includes_us_feed(self):
+        res = self.client.get("/api/segments/status")
+        self.assertEqual(res.status_code, 200)
+        data = res.get_json()
+        self.assertIn("dhan_us_live_feed", data)
+        self.assertIn("mode", data["dhan_us_live_feed"])
 
 
 if __name__ == "__main__":

@@ -480,6 +480,7 @@ async function fetchSegmentsStatus() {
         if (!res.ok) return;
         const data = await res.json();
         const wsEl = document.getElementById("segment-ws-status");
+        const usWsEl = document.getElementById("segment-us-ws-status");
         const prodEl = document.getElementById("segment-product-type");
         const fnoEl = document.getElementById("segment-fno-status");
         const mcxEl = document.getElementById("segment-mcx-status");
@@ -493,6 +494,20 @@ async function fetchSegmentsStatus() {
             wsEl.innerHTML = isConn
                 ? `<i class="fa-solid fa-wifi" style="color: #4ade80;"></i> Connected (${sub} sym, ${age}s)`
                 : `<i class="fa-solid fa-wifi" style="color: #f87171;"></i> REST Fallback`;
+        }
+        if (usWsEl) {
+            const usFeed = data.dhan_us_live_feed || (data.segments && data.segments.us_global && data.segments.us_global.live_feed) || {};
+            const isConn = usFeed.connected;
+            const age = usFeed.last_heartbeat_age_sec;
+            const sub = usFeed.subscribed_count != null ? usFeed.subscribed_count : "?";
+            const mode = usFeed.mode || "off";
+            if (!usFeed.enabled && mode === "rest_yahoo_fallback") {
+                usWsEl.innerHTML = `<i class="fa-solid fa-wifi" style="color: #94a3b8;"></i> Off (Yahoo/REST)`;
+            } else if (isConn) {
+                usWsEl.innerHTML = `<i class="fa-solid fa-wifi" style="color: #4ade80;"></i> US Live (${sub} sym, ${age}s)`;
+            } else {
+                usWsEl.innerHTML = `<i class="fa-solid fa-wifi" style="color: #fbbf24;"></i> US ${mode}`;
+            }
         }
         if (prodEl && data.product_type) {
             prodEl.textContent = data.product_type + " Mode";

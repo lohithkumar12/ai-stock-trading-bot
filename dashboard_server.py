@@ -274,6 +274,17 @@ def get_segments_status():
 
     ws_feed = get_live_feed_manager()
 
+    us_feed_summary = {}
+    us_master = {}
+    try:
+        from dhan_us_live_feed import get_us_live_feed_manager
+        from us_instruments import master_status as us_master_status
+
+        us_feed_summary = get_us_live_feed_manager().status_summary()
+        us_master = us_master_status()
+    except Exception:
+        us_feed_summary = {"enabled": False, "connected": False, "mode": "unavailable"}
+
     fno_util = mcx_util = cur_util = {}
     fno_pos = mcx_pos = cur_pos = {}
     try:
@@ -341,12 +352,16 @@ def get_segments_status():
     us_info = {
         "enabled": config.US_ENABLED,
         "mode": "PAPER" if config.US_PAPER else ("LIVE" if config.US_LIVE_CONFIRMED else "DISABLED"),
+        "live_feed": us_feed_summary,
+        "scrip_master": us_master,
     }
 
     return jsonify({
         "status": "success",
         "dhan_live_feed": ws_feed.status_summary(),
+        "dhan_us_live_feed": us_feed_summary,
         "scrip_master": master_status(),
+        "us_scrip_master": us_master,
         "product_type": config.INDIA_PRODUCT_TYPE,
         "expansion_positions": fno_rows + mcx_rows + fx_rows,
         "segments": {
@@ -574,6 +589,14 @@ def get_us_status():
     daily_pl = equity - last_eq
     daily_pl_pct = (daily_pl / last_eq * 100) if last_eq else 0.0
 
+    us_feed_summary = {}
+    try:
+        from dhan_us_live_feed import get_us_live_feed_manager
+
+        us_feed_summary = get_us_live_feed_manager().status_summary()
+    except Exception:
+        us_feed_summary = {"enabled": False, "connected": False, "mode": "unavailable"}
+
     return jsonify({
         "status": "success",
         "market": "US",
@@ -592,6 +615,7 @@ def get_us_status():
         "paper_trading": config.US_PAPER,
         "live_armed": config.US_LIVE_CONFIRMED,
         "global_activated": us_broker.global_stocks_available,
+        "live_feed": us_feed_summary,
         "strategy": config.STRATEGY_NAME,
         "kill_switch_active": us_risk.is_kill_switch_active,
         "equity_history": _us_equity_history,
