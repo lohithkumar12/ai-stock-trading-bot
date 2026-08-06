@@ -106,18 +106,12 @@ DHAN_US_LIVE_WEBSOCKET: bool = (
 )
 
 INDIA_STOCK_UNIVERSE: list[str] = [
-    "RELIANCE",
-    "TCS",
-    "HDFCBANK",
-    "INFY",
-    "ICICIBANK",
-    "HINDUNILVR",
-    "ITC",
-    "SBIN",
-    "BHARTIARTL",
-    "LT",
-    "KOTAKBANK",
-    "WIPRO",
+    s.strip().upper()
+    for s in os.getenv(
+        "INDIA_STOCK_UNIVERSE",
+        "RELIANCE,TCS,HDFCBANK,INFY,ICICIBANK,HINDUNILVR,ITC,SBIN,BHARTIARTL,LT,KOTAKBANK,WIPRO",
+    ).split(",")
+    if s.strip()
 ]
 
 INDIA_CORRELATION_CLUSTERS: dict[str, list[str]] = {
