@@ -8,12 +8,16 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 import config
 
 logger = logging.getLogger(__name__)
 
-PAPER_CURRENCY_FILE = Path("currency_paper_portfolio.json")
+_default = Path(__file__).resolve().parent / "currency_paper_portfolio.json"
+PAPER_CURRENCY_FILE = Path(
+    os.getenv("CURRENCY_PAPER_PORTFOLIO_PATH", str(_default))
+).expanduser().resolve()
 
 
 class CurrencyPaperPortfolio:
@@ -37,6 +41,7 @@ class CurrencyPaperPortfolio:
 
     def _save(self):
         try:
+            PAPER_CURRENCY_FILE.parent.mkdir(parents=True, exist_ok=True)
             with open(PAPER_CURRENCY_FILE, "w", encoding="utf-8") as f:
                 json.dump({
                     "cash": self.cash,

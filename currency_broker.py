@@ -16,6 +16,7 @@ import config
 from currency_paper import CurrencyPaperPortfolio
 from dhan_broker import get_shared_dhan_broker
 from india_fno_instruments import is_placeholder_security_id, resolve_instrument_info
+from price_guards import mark_vs_entry_sane, require_tradeable_quote
 from risk_manager import RiskManager
 
 try:
@@ -80,6 +81,17 @@ class CurrencyBroker:
         if self.risk_mgr.is_kill_switch_active:
             logger.warning("[CURRENCY] Kill switch active — block")
             return None
+
+        quote = self.dhan_broker.get_latest_quote(symbol)
+        live_px, qerr = require_tradeable_quote(symbol, quote, segment="FX")
+        if qerr:
+            logger.error(f"[CURRENCY] Order blocked — {qerr}")
+            return None
+        if abs(live_px - price) / max(live_px, price) > 0.05:
+            logger.warning(
+                f"[CURRENCY] Repricing {symbol}: caller={price:.4f} live={live_px:.4f}"
+            )
+            price = live_px
 
         total_cost = qty * price
         if total_cost > config.CURRENCY_CAPITAL_CAP:
@@ -155,7 +167,15 @@ class CurrencyBroker:
             return closed
         for sym, pos in list(self.paper.positions.items()):
             quote = self.dhan_broker.get_latest_quote(sym)
-            mark = float(quote["ltp"]) if quote else float(pos.get("avg_price") or 0)
+            mark, qerr = require_tradeable_quote(sym, quote, segment="FX")
+            if qerr:
+                logger.warning(f"[CURRENCY] Skip exit check {sym}: {qerr}")
+                continue
+            entry = float(pos.get("avg_price") or 0)
+            sane, serr = mark_vs_entry_sane(entry, mark)
+            if not sane:
+                logger.error(f"[CURRENCY] Refusing exit {sym}: {serr}")
+                continue
             sl = float(pos.get("stop_loss") or 0)
             tp = float(pos.get("take_profit") or 0)
             reason = None

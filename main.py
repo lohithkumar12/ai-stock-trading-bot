@@ -810,10 +810,12 @@ def run_bot():
                                 logger.warning("[FNO] Kill switch — idle")
                                 break
                             quote = fno_broker.dhan_broker.get_latest_quote(sym)
-                            if not quote:
-                                logger.info(f"[FNO] {sym}: skip — no quote")
+                            from price_guards import require_tradeable_quote
+
+                            spot, qerr = require_tradeable_quote(sym, quote, segment="FNO")
+                            if qerr:
+                                logger.info(f"[FNO] {sym}: skip — {qerr}")
                                 continue
-                            spot = float(quote.get("ltp", 0))
                             df = fno_broker.dhan_broker.get_historical_candles(
                                 sym, timeframe="1Hour", days=30
                             )
@@ -888,10 +890,12 @@ def run_bot():
                             if mcx_broker.risk_mgr.is_kill_switch_active:
                                 break
                             quote = mcx_broker.dhan_broker.get_latest_quote(sym)
-                            if not quote:
-                                logger.info(f"[MCX] {sym}: skip — no quote")
+                            from price_guards import require_tradeable_quote
+
+                            price, qerr = require_tradeable_quote(sym, quote, segment="MCX")
+                            if qerr:
+                                logger.info(f"[MCX] {sym}: skip — {qerr}")
                                 continue
-                            price = float(quote.get("ltp", 0))
                             df = mcx_broker.dhan_broker.get_historical_candles(
                                 sym, timeframe="1Hour", days=45
                             )
@@ -956,36 +960,21 @@ def run_bot():
                             if currency_broker.risk_mgr.is_kill_switch_active:
                                 break
                             quote = currency_broker.dhan_broker.get_latest_quote(sym)
-                            if not quote:
-                                logger.info(f"[CURRENCY] {sym}: skip — no quote")
+                            from price_guards import require_tradeable_quote
+
+                            price, qerr = require_tradeable_quote(sym, quote, segment="FX")
+                            if qerr:
+                                logger.info(f"[CURRENCY] {sym}: skip — {qerr}")
                                 continue
-                            price = float(quote.get("ltp", 0))
                             df = currency_broker.dhan_broker.get_historical_candles(
                                 sym, timeframe="1Hour", days=60
                             )
                             min_bars = 10 if config.CURRENCY_PAPER else 30
                             if df is None or len(df) < min_bars:
-                                # Paper: if we have a live LTP, allow a quote-only entry path
-                                # so FX is not permanently dead when history is thin.
-                                if (
-                                    config.CURRENCY_PAPER
-                                    and not config.CURRENCY_LIVE_CONFIRMED
-                                    and price > 0
-                                ):
-                                    logger.warning(
-                                        f"[CURRENCY] {sym}: thin candles "
-                                        f"({0 if df is None else len(df)}) — paper quote-only path"
-                                    )
-                                    sl = price * 0.998
-                                    tp = price * 1.003
-                                    currency_broker.place_buy_order(
-                                        sym, 1, price, stop_loss=sl, take_profit=tp
-                                    )
-                                else:
-                                    logger.info(
-                                        f"[CURRENCY] {sym}: skip — insufficient candles "
-                                        f"({0 if df is None else len(df)}<{min_bars})"
-                                    )
+                                logger.info(
+                                    f"[CURRENCY] {sym}: skip — insufficient candles "
+                                    f"({0 if df is None else len(df)}<{min_bars})"
+                                )
                                 continue
                             rsi, adx, sma_fast, sma_slow, atr = _calc_rsi_adx(df)
                             if config.CURRENCY_PAPER and not config.CURRENCY_LIVE_CONFIRMED:

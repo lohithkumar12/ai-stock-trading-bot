@@ -9,12 +9,16 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 import config
 
 logger = logging.getLogger(__name__)
 
-PAPER_FNO_FILE = Path("india_fno_paper_portfolio.json")
+_default = Path(__file__).resolve().parent / "india_fno_paper_portfolio.json"
+PAPER_FNO_FILE = Path(
+    os.getenv("INDIA_FNO_PAPER_PORTFOLIO_PATH", str(_default))
+).expanduser().resolve()
 
 
 class IndiaFnoPaperPortfolio:
@@ -38,6 +42,7 @@ class IndiaFnoPaperPortfolio:
 
     def _save(self):
         try:
+            PAPER_FNO_FILE.parent.mkdir(parents=True, exist_ok=True)
             with open(PAPER_FNO_FILE, "w", encoding="utf-8") as f:
                 json.dump({
                     "cash": self.cash,

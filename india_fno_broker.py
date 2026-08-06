@@ -21,6 +21,7 @@ from india_fno_instruments import (
     resolve_option_contract,
 )
 from india_fno_paper import IndiaFnoPaperPortfolio
+from price_guards import require_tradeable_quote, validate_option_premium
 from risk_manager import RiskManager
 
 try:
@@ -137,7 +138,14 @@ class IndiaFnoBroker:
             )
             return 0.0
 
-        # Paper-only estimate when chain unavailable (market closed / API miss)
+        # Paper estimates only when explicitly allowed (unsafe for live rehearsal)
+        if not getattr(config, "ALLOW_PAPER_PRICE_ESTIMATES", False):
+            logger.warning(
+                f"[FNO] No live premium for {symbol} {strike} {option_type} — "
+                f"refusing paper estimate (set ALLOW_PAPER_PRICE_ESTIMATES=true to override)"
+            )
+            return 0.0
+
         logger.info(
             f"[PAPER F&O ESTIMATE] Using paper estimation mark for {symbol} {strike} {option_type}"
         )
@@ -188,11 +196,13 @@ class IndiaFnoBroker:
         estimated = False
         if limit_price <= 0:
             limit_price = self.fetch_live_option_premium(symbol, strike, option_type)
-            estimated = config.INDIA_FNO_PAPER and not config.INDIA_FNO_LIVE_CONFIRMED
-            if estimated and limit_price > 0:
-                logger.info(
-                    f"[PAPER F&O ESTIMATE] Premium for {symbol} {strike} {option_type}: Rs{limit_price:.2f}"
-                )
+            # fetch_live_option_premium already refuses estimates unless allowed
+            estimated = False
+
+        ok_prem, prem_err = validate_option_premium(limit_price, estimated=estimated)
+        if not ok_prem:
+            logger.error(f"[FNO] Cannot place order for {symbol} {strike} {option_type}: {prem_err}")
+            return None
 
         if limit_price <= 0:
             logger.error(f"[FNO] Cannot place order for {symbol} {strike} {option_type}: premium is 0")

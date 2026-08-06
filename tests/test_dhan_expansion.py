@@ -216,6 +216,38 @@ class TestDhanExpansionProductionSuite(unittest.TestCase):
         for key in ("enabled", "connected", "cached_symbols_count", "subscribed_count"):
             self.assertIn(key, feed)
 
+    def test_price_guards_reject_fake_mcx_and_fallback(self):
+        """Fake Rs1500 MCX marks and paper_fallback quotes must be rejected."""
+        from price_guards import (
+            is_trusted_quote,
+            mark_vs_entry_sane,
+            require_tradeable_quote,
+            validate_mcx_price,
+        )
+
+        ok, _ = validate_mcx_price("SILVER", 1500.0)
+        self.assertFalse(ok)
+        ok, _ = validate_mcx_price("SILVER", 226672.0)
+        self.assertTrue(ok)
+        ok, _ = validate_mcx_price("NATURALGAS", 255.0)
+        self.assertTrue(ok)
+
+        self.assertFalse(is_trusted_quote({"ltp": 1500.0, "source": "paper_fallback"}))
+        self.assertTrue(is_trusted_quote({"ltp": 255.0, "source": "ticker_data"}))
+
+        px, err = require_tradeable_quote(
+            "SILVER", {"ltp": 1500.0, "source": "ticker_data"}, segment="MCX"
+        )
+        self.assertEqual(px, 0.0)
+        self.assertTrue(err)
+
+        sane, _ = mark_vs_entry_sane(1500.0, 226672.0)
+        self.assertFalse(sane)
+
+        # Broker must not invent paper_fallback quotes anymore
+        q = self.broker._quote_from_candle_cache("SILVER")
+        self.assertIsNone(q)
+
     def test_r2_scrip_master_and_option_resolution(self):
         """R2: Verify scrip master loading and option contract resolution."""
         loaded = load_dhan_scrip_master()

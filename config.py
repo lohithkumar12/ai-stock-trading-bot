@@ -143,6 +143,9 @@ INDIA_FNO_MAX_LOTS: int = _env_int("INDIA_FNO_MAX_LOTS", "2")
 INDIA_FNO_STRATEGY: str = os.getenv("INDIA_FNO_STRATEGY", "directional_options").strip().lower()
 INDIA_FNO_CAPITAL_CAP: float = _env_float("INDIA_FNO_CAPITAL_CAP", "200000.0")
 
+# Never invent MCX/FX/F&O marks for paper (required false before live money).
+ALLOW_PAPER_PRICE_ESTIMATES: bool = _env_bool("ALLOW_PAPER_PRICE_ESTIMATES", "false")
+
 # ===========================================================================
 # MCX Commodities Market Segment (Gold, Silver, Crude, NatGas)
 # ===========================================================================

@@ -669,7 +669,10 @@ class DhanBroker:
         logger.warning(msg)
 
     def _quote_from_candle_cache(self, symbol: str) -> dict | None:
-        """Fallback when marketfeed LTP is unavailable (rate limit / Data API)."""
+        """Fallback when marketfeed LTP is unavailable (rate limit / Data API).
+
+        Never invents fake prices (old Rs1500 paper_fallback caused bogus MCX P&L).
+        """
         cached = self._candle_cache.get(symbol)
         if cached:
             _, df = cached
@@ -690,21 +693,6 @@ class DhanBroker:
                             "source": "candle_close",
                         },
                     )
-
-        # Paper sim fallback mark when market is closed or unauthenticated
-        if self.paper is not None:
-            fallback_price = 2500.0 if symbol == "RELIANCE" else (3500.0 if symbol == "TCS" else 1500.0)
-            return self._cache_quote(
-                symbol,
-                {
-                    "ltp": fallback_price,
-                    "ask_price": fallback_price,
-                    "symbol": symbol,
-                    "exchange": get_exchange(symbol),
-                    "source": "paper_fallback",
-                },
-            )
-
         return None
 
     def get_latest_quote(self, symbol: str) -> dict | None:
