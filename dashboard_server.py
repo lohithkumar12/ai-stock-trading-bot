@@ -406,11 +406,65 @@ def close_india_position(symbol):
     if not india_broker:
         return jsonify({"status": "error", "message": "India broker not available"}), 500
 
+    symbol = symbol.strip().upper()
+    positions = india_broker.get_open_positions() or {}
+    pos = positions.get(symbol)
+    if not pos:
+        return jsonify({"status": "error", "message": f"No open India position for {symbol}"}), 404
+
+    qty = int(pos.get("qty") or 0)
+    entry = float(pos.get("avg_entry_price") or 0)
+    exit_px = float(pos.get("current_price") or entry)
+    unreal = float(pos.get("unrealized_pl") or ((exit_px - entry) * qty))
+
     success = india_broker.close_position(symbol)
-    if success:
-        return jsonify({"status": "success", "message": f"Closed India position for {symbol}"})
-    else:
+    if not success:
         return jsonify({"status": "error", "message": f"Failed to close India position for {symbol}"}), 400
+
+    # Journal the exit so Recent Trades / performance P&L update
+    journal_row = trade_journal.record_exit(
+        "INDIA", symbol, exit_px, reason="manual_close", qty=qty
+    )
+    if journal_row is None and entry > 0 and qty > 0:
+        # Position existed in paper but was never journaled on entry
+        trade_journal.record_entry(
+            "INDIA",
+            symbol,
+            qty,
+            entry,
+            reason="manual_close_backfill",
+            strategy=config.STRATEGY_NAME,
+        )
+        journal_row = trade_journal.record_exit(
+            "INDIA", symbol, exit_px, reason="manual_close", qty=qty
+        )
+
+    india_risk = get_india_risk()
+    if india_risk:
+        india_risk.clear_trade(symbol)
+
+    acct = india_broker.get_account_info() or {}
+    equity = float(acct.get("equity") or 0)
+    last_eq = float(bot_state.india_sod_equity(equity)) if equity else 0.0
+    daily_pl = equity - last_eq if last_eq else 0.0
+    pnl = float(journal_row["pnl"]) if journal_row else unreal
+    pnl_pct = float(journal_row["pnl_pct"]) if journal_row else (
+        ((exit_px - entry) / entry) if entry else 0.0
+    )
+
+    return jsonify({
+        "status": "success",
+        "message": f"Closed {symbol} | P&L: ₹{pnl:+,.2f} ({pnl_pct:+.2%})",
+        "symbol": symbol,
+        "qty": qty,
+        "entry_price": entry,
+        "exit_price": exit_px,
+        "pnl": round(pnl, 2),
+        "pnl_pct": round(pnl_pct * 100, 2),
+        "equity": equity,
+        "daily_pl": round(daily_pl, 2),
+        "available_cash": acct.get("available_cash"),
+    })
 
 
 @app.route("/api/toggle_kill_switch", methods=["POST"])
@@ -722,11 +776,63 @@ def close_us_position(symbol):
     if not us_broker:
         return jsonify({"status": "error", "message": "US broker not available"}), 500
 
+    symbol = symbol.strip().upper()
+    positions = us_broker.get_open_positions() or {}
+    pos = positions.get(symbol)
+    if not pos:
+        return jsonify({"status": "error", "message": f"No open US position for {symbol}"}), 404
+
+    qty = int(pos.get("qty") or 0)
+    entry = float(pos.get("avg_entry_price") or 0)
+    exit_px = float(pos.get("current_price") or entry)
+    unreal = float(pos.get("unrealized_pl") or ((exit_px - entry) * qty))
+
     success = us_broker.close_position(symbol)
-    if success:
-        return jsonify({"status": "success", "message": f"Closed US position for {symbol}"})
-    else:
+    if not success:
         return jsonify({"status": "error", "message": f"Failed to close US position for {symbol}"}), 400
+
+    journal_row = trade_journal.record_exit(
+        "US", symbol, exit_px, reason="manual_close", qty=qty
+    )
+    if journal_row is None and entry > 0 and qty > 0:
+        trade_journal.record_entry(
+            "US",
+            symbol,
+            qty,
+            entry,
+            reason="manual_close_backfill",
+            strategy=config.STRATEGY_NAME,
+        )
+        journal_row = trade_journal.record_exit(
+            "US", symbol, exit_px, reason="manual_close", qty=qty
+        )
+
+    us_risk = get_us_risk()
+    if us_risk:
+        us_risk.clear_trade(symbol)
+
+    acct = us_broker.get_account_info() or {}
+    equity = float(acct.get("equity") or 0)
+    last_eq = float(bot_state.us_sod_equity(equity)) if equity else 0.0
+    daily_pl = equity - last_eq if last_eq else 0.0
+    pnl = float(journal_row["pnl"]) if journal_row else unreal
+    pnl_pct = float(journal_row["pnl_pct"]) if journal_row else (
+        ((exit_px - entry) / entry) if entry else 0.0
+    )
+
+    return jsonify({
+        "status": "success",
+        "message": f"Closed {symbol} | P&L: ${pnl:+,.2f} ({pnl_pct:+.2%})",
+        "symbol": symbol,
+        "qty": qty,
+        "entry_price": entry,
+        "exit_price": exit_px,
+        "pnl": round(pnl, 2),
+        "pnl_pct": round(pnl_pct * 100, 2),
+        "equity": equity,
+        "daily_pl": round(daily_pl, 2),
+        "available_cash": acct.get("available_cash"),
+    })
 
 
 @app.route("/api/us/toggle_kill_switch", methods=["POST"])

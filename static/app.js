@@ -435,8 +435,18 @@ async function closePosition(symbol) {
     try {
         const res = await fetch(url, { method: 'POST' });
         const data = await res.json();
-        alert(data.message);
+        if (data.status === "success" && data.pnl != null) {
+            const fmt = activeMarket === "US" ? formatUSD : formatINR;
+            alert(
+                `${data.message}\n` +
+                `Entry ${fmt(data.entry_price)} → Exit ${fmt(data.exit_price)}\n` +
+                `Equity now: ${fmt(data.equity)} | Daily P&L: ${fmt(data.daily_pl)}`
+            );
+        } else {
+            alert(data.message || "Close failed");
+        }
         fetchCurrentTabData();
+        fetchTrades();
     } catch (e) {
         alert("Failed to close position: " + e);
     }

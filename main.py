@@ -796,7 +796,9 @@ def run_bot():
                             df = fno_broker.dhan_broker.get_historical_candles(
                                 sym, timeframe="1Hour", days=30
                             )
-                            if df is None or len(df) < 30:
+                            min_bars = 20 if config.INDIA_FNO_PAPER else 30
+                            if df is None or len(df) < min_bars:
+                                logger.info(f"[FNO] {sym}: skip — insufficient candles")
                                 continue
                             rsi, adx, sma_fast, sma_slow, atr = _calc_rsi_adx(df)
                             sig = fno_strat.generate_signal(
@@ -809,6 +811,10 @@ def run_bot():
                                 atr=atr,
                             )
                             if not sig:
+                                logger.info(
+                                    f"[FNO] {sym}: skip — {fno_strat.last_skip_reason or 'no signal'} "
+                                    f"(RSI={rsi:.1f} ADX={adx:.1f})"
+                                )
                                 continue
                             chain = fno_broker.get_option_chain(sym)
                             strike = fno_broker.get_atm_strike(sym, spot, chain=chain)
@@ -864,12 +870,21 @@ def run_bot():
                             df = mcx_broker.dhan_broker.get_historical_candles(
                                 sym, timeframe="1Hour", days=15
                             )
-                            if df is None or len(df) < 30:
-                                logger.debug(f"[MCX] {sym}: insufficient candles — idle")
+                            min_bars = 20 if config.MCX_PAPER else 30
+                            if df is None or len(df) < min_bars:
+                                logger.info(f"[MCX] {sym}: skip — insufficient candles")
                                 continue
                             rsi, adx, sma_fast, sma_slow, atr = _calc_rsi_adx(df)
-                            # Defined-risk long-only: RSI<32, uptrend SMA, ADX>18
-                            if rsi < 32.0 and adx > 18.0 and sma_fast >= sma_slow * 0.995:
+                            # Paper: RSI<45 + ADX>12; Live: RSI<32 + ADX>18 + SMA filter
+                            if config.MCX_PAPER and not config.MCX_LIVE_CONFIRMED:
+                                ok = rsi < 45.0 and adx > 12.0
+                            else:
+                                ok = (
+                                    rsi < 32.0
+                                    and adx > 18.0
+                                    and sma_fast >= sma_slow * 0.995
+                                )
+                            if ok:
                                 sl = price - max(atr * 1.5, price * 0.01)
                                 tp = price + max(atr * 2.5, price * 0.015)
                                 logger.info(
@@ -879,9 +894,9 @@ def run_bot():
                                     sym, 1, price, stop_loss=sl, take_profit=tp
                                 )
                                 idle_until_quality = False
-                            elif idle_until_quality:
-                                logger.debug(
-                                    f"[MCX] {sym}: no quality signal (RSI={rsi:.1f} ADX={adx:.1f}) — log-only"
+                            else:
+                                logger.info(
+                                    f"[MCX] {sym}: skip — no setup (RSI={rsi:.1f} ADX={adx:.1f})"
                                 )
                     else:
                         logger.debug("[MCX] Outside session — idle")
@@ -919,11 +934,16 @@ def run_bot():
                             df = currency_broker.dhan_broker.get_historical_candles(
                                 sym, timeframe="1Hour", days=15
                             )
-                            if df is None or len(df) < 30:
-                                logger.debug(f"[CURRENCY] {sym}: insufficient candles — idle")
+                            min_bars = 20 if config.CURRENCY_PAPER else 30
+                            if df is None or len(df) < min_bars:
+                                logger.info(f"[CURRENCY] {sym}: skip — insufficient candles")
                                 continue
                             rsi, adx, sma_fast, sma_slow, atr = _calc_rsi_adx(df)
-                            if rsi < 30.0 and adx > 15.0 and price > 0:
+                            if config.CURRENCY_PAPER and not config.CURRENCY_LIVE_CONFIRMED:
+                                ok = rsi < 48.0 and adx > 10.0 and price > 0
+                            else:
+                                ok = rsi < 30.0 and adx > 15.0 and price > 0
+                            if ok:
                                 sl = price - max(atr * 1.5, price * 0.002)
                                 tp = price + max(atr * 2.0, price * 0.003)
                                 logger.info(
@@ -933,8 +953,8 @@ def run_bot():
                                     sym, 1, price, stop_loss=sl, take_profit=tp
                                 )
                             else:
-                                logger.debug(
-                                    f"[CURRENCY] {sym}: no quality signal (RSI={rsi:.1f}) — idle"
+                                logger.info(
+                                    f"[CURRENCY] {sym}: skip — no setup (RSI={rsi:.1f} ADX={adx:.1f})"
                                 )
                     else:
                         logger.debug("[CURRENCY] Outside session — idle")
