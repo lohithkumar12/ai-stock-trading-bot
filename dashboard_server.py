@@ -237,6 +237,36 @@ def get_india_positions():
     return jsonify(positions_list)
 
 
+def _serialize_segment_positions(segment: str, positions: dict) -> list[dict]:
+    """Normalize F&O / MCX / FX paper positions for the dashboard."""
+    rows = []
+    for key, pos in (positions or {}).items():
+        qty = int(pos.get("qty") or 0)
+        avg = float(pos.get("avg_entry_price") or pos.get("avg_price") or 0)
+        cur = float(pos.get("current_price") or avg)
+        mv = float(pos.get("market_value") or (qty * cur))
+        upl = float(pos.get("unrealized_pl") or 0)
+        uplpc = float(pos.get("unrealized_plpc") or 0)
+        if abs(uplpc) < 1 and abs(uplpc) > 0 and abs(upl) > 0:
+            # paper helpers return fraction; show percent like equity API
+            uplpc = round(uplpc * 100, 2)
+        else:
+            uplpc = round(uplpc, 2)
+        rows.append({
+            "segment": segment,
+            "symbol": pos.get("contract_key") or pos.get("symbol") or key,
+            "qty": qty,
+            "avg_entry_price": avg,
+            "current_price": cur,
+            "market_value": mv,
+            "unrealized_pl": upl,
+            "unrealized_plpc": uplpc,
+            "stop_loss": float(pos.get("stop_loss") or 0),
+            "take_profit": float(pos.get("take_profit") or 0),
+        })
+    return rows
+
+
 @app.route("/api/segments/status")
 def get_segments_status():
     from dhan_live_feed import get_live_feed_manager
@@ -271,6 +301,10 @@ def get_segments_status():
     except Exception:
         pass
 
+    fno_rows = _serialize_segment_positions("F&O", fno_pos)
+    mcx_rows = _serialize_segment_positions("MCX", mcx_pos)
+    fx_rows = _serialize_segment_positions("FX", cur_pos)
+
     fno_info = {
         "enabled": config.INDIA_FNO_ENABLED,
         "mode": "PAPER" if config.INDIA_FNO_PAPER else ("LIVE" if config.INDIA_FNO_LIVE_CONFIRMED else "DISABLED"),
@@ -278,6 +312,7 @@ def get_segments_status():
         "max_lots": config.INDIA_FNO_MAX_LOTS,
         "utilization": fno_util,
         "positions_count": len(fno_pos),
+        "positions": fno_rows,
         "kill_switch": fno_util.get("kill_switch", False),
     }
     mcx_info = {
@@ -286,6 +321,7 @@ def get_segments_status():
         "capital_cap": config.MCX_CAPITAL_CAP,
         "utilization": mcx_util,
         "positions_count": len(mcx_pos),
+        "positions": mcx_rows,
         "kill_switch": mcx_util.get("kill_switch", False),
     }
     currency_info = {
@@ -294,6 +330,7 @@ def get_segments_status():
         "capital_cap": config.CURRENCY_CAPITAL_CAP,
         "utilization": cur_util,
         "positions_count": len(cur_pos),
+        "positions": fx_rows,
         "kill_switch": cur_util.get("kill_switch", False),
     }
     equity_info = {
@@ -311,6 +348,7 @@ def get_segments_status():
         "dhan_live_feed": ws_feed.status_summary(),
         "scrip_master": master_status(),
         "product_type": config.INDIA_PRODUCT_TYPE,
+        "expansion_positions": fno_rows + mcx_rows + fx_rows,
         "segments": {
             "india_equity": equity_info,
             "india_fno": fno_info,

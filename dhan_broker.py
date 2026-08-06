@@ -466,12 +466,24 @@ class DhanBroker:
         """Fetches historical candles for equities, F&O underlyings, MCX, or Currency (OI when available)."""
         return self.get_historical_bars(symbol, days=days)
 
+    @staticmethod
+    def _segment_hint_for_symbol(symbol: str) -> str:
+        sym = (symbol or "").strip().upper()
+        if sym in ("USDINR", "EURINR", "GBPINR", "JPYINR"):
+            return "NSE_CURRENCY"
+        if sym in ("CRUDEOIL", "GOLD", "SILVER", "NATURALGAS"):
+            return "MCX_COMM"
+        if sym in ("NIFTY", "BANKNIFTY", "FINNIFTY"):
+            return "IDX_I"
+        return "NSE"
+
     def get_historical_bars(self, symbol: str, days: int = 300) -> pd.DataFrame | None:
         self.ensure_session()
         if not self.dhan:
             return None
 
-        sec_info = resolve_instrument_info(symbol)
+        hint = self._segment_hint_for_symbol(symbol)
+        sec_info = resolve_instrument_info(symbol, exchange_segment=hint)
         sec_id = sec_info.get("security_id") if not is_placeholder_security_id(sec_info.get("security_id")) else None
         sec_id = sec_id or self._security_id(symbol)
         if not sec_id or is_placeholder_security_id(sec_id):
@@ -507,32 +519,74 @@ class DhanBroker:
             segment = segment if segment in ("NSE_EQ", "BSE_EQ") else "NSE_EQ"
 
         to_date = datetime.now()
-        from_date = to_date - timedelta(days=days)
+        # Currency/MCX need wider lookback — thin sessions + contract rolls
+        fetch_days = max(days, 45 if inst_type in ("FUTCUR", "FUTCOM") else days)
+        from_date = to_date - timedelta(days=fetch_days)
         frames: list[pd.DataFrame] = []
+
+        segment_candidates = [segment]
+        if inst_type == "FUTCUR":
+            for alt in ("NSE_CURRENCY", "NSE_CURR"):
+                if alt not in segment_candidates:
+                    segment_candidates.append(alt)
 
         chunk_start = from_date
         try:
             while chunk_start < to_date:
                 chunk_end = min(chunk_start + timedelta(days=INTRADAY_CHUNK_DAYS), to_date)
-                self._throttle_candles()
-                resp = self.dhan.intraday_minute_data(
-                    security_id=str(sec_id),
-                    exchange_segment=segment,
-                    instrument_type=inst_type,
-                    from_date=chunk_start.strftime("%Y-%m-%d %H:%M:%S"),
-                    to_date=chunk_end.strftime("%Y-%m-%d %H:%M:%S"),
-                    interval=60,
-                )
-                if self._ok(resp):
-                    part = self._parse_intraday(self._data(resp))
-                    if part is not None and not part.empty:
-                        frames.append(part)
-                else:
-                    logger.debug(f"{symbol}: intraday chunk miss: {resp}")
+                part = None
+                for seg_try in segment_candidates:
+                    self._throttle_candles()
+                    resp = self.dhan.intraday_minute_data(
+                        security_id=str(sec_id),
+                        exchange_segment=seg_try,
+                        instrument_type=inst_type,
+                        from_date=chunk_start.strftime("%Y-%m-%d %H:%M:%S"),
+                        to_date=chunk_end.strftime("%Y-%m-%d %H:%M:%S"),
+                        interval=60,
+                    )
+                    if self._ok(resp):
+                        part = self._parse_intraday(self._data(resp))
+                        if part is not None and not part.empty:
+                            frames.append(part)
+                            segment = seg_try
+                            break
+                    else:
+                        logger.debug(f"{symbol}: intraday chunk miss ({seg_try}): {resp}")
                 chunk_start = chunk_end
 
+            # Daily fallback when intraday empty (common for rolled FX/MCX contracts)
             if not frames:
-                logger.warning(f"{symbol}: No Dhan candle data")
+                daily_fn = getattr(self.dhan, "historical_daily_data", None)
+                if callable(daily_fn):
+                    for seg_try in segment_candidates:
+                        try:
+                            self._throttle_candles()
+                            resp = daily_fn(
+                                security_id=str(sec_id),
+                                exchange_segment=seg_try,
+                                instrument_type=inst_type,
+                                from_date=from_date.strftime("%Y-%m-%d"),
+                                to_date=to_date.strftime("%Y-%m-%d"),
+                            )
+                            if self._ok(resp):
+                                part = self._parse_intraday(self._data(resp))
+                                if part is not None and not part.empty:
+                                    frames.append(part)
+                                    logger.info(
+                                        f"{symbol}: using daily history fallback "
+                                        f"({len(part)} bars, seg={seg_try})"
+                                    )
+                                    break
+                        except Exception as daily_e:
+                            logger.debug(f"{symbol}: daily history miss ({seg_try}): {daily_e}")
+
+            if not frames:
+                logger.warning(
+                    f"{symbol}: No Dhan candle data "
+                    f"(sec_id={sec_id} seg={segment} inst={inst_type} "
+                    f"contract={sec_info.get('trading_symbol')})"
+                )
                 if symbol in self._candle_cache:
                     return self._candle_cache[symbol][1]
                 return None

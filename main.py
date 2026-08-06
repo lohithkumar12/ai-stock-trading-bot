@@ -811,6 +811,7 @@ def run_bot():
                                 break
                             quote = fno_broker.dhan_broker.get_latest_quote(sym)
                             if not quote:
+                                logger.info(f"[FNO] {sym}: skip — no quote")
                                 continue
                             spot = float(quote.get("ltp", 0))
                             df = fno_broker.dhan_broker.get_historical_candles(
@@ -818,7 +819,10 @@ def run_bot():
                             )
                             min_bars = 20 if config.INDIA_FNO_PAPER else 30
                             if df is None or len(df) < min_bars:
-                                logger.info(f"[FNO] {sym}: skip — insufficient candles")
+                                logger.info(
+                                    f"[FNO] {sym}: skip — insufficient candles "
+                                    f"({0 if df is None else len(df)}<{min_bars})"
+                                )
                                 continue
                             rsi, adx, sma_fast, sma_slow, atr = _calc_rsi_adx(df)
                             sig = fno_strat.generate_signal(
@@ -885,14 +889,18 @@ def run_bot():
                                 break
                             quote = mcx_broker.dhan_broker.get_latest_quote(sym)
                             if not quote:
+                                logger.info(f"[MCX] {sym}: skip — no quote")
                                 continue
                             price = float(quote.get("ltp", 0))
                             df = mcx_broker.dhan_broker.get_historical_candles(
-                                sym, timeframe="1Hour", days=15
+                                sym, timeframe="1Hour", days=45
                             )
-                            min_bars = 20 if config.MCX_PAPER else 30
+                            min_bars = 15 if config.MCX_PAPER else 30
                             if df is None or len(df) < min_bars:
-                                logger.info(f"[MCX] {sym}: skip — insufficient candles")
+                                logger.info(
+                                    f"[MCX] {sym}: skip — insufficient candles "
+                                    f"({0 if df is None else len(df)}<{min_bars})"
+                                )
                                 continue
                             rsi, adx, sma_fast, sma_slow, atr = _calc_rsi_adx(df)
                             # Paper: RSI<45 + ADX>12; Live: RSI<32 + ADX>18 + SMA filter
@@ -949,14 +957,35 @@ def run_bot():
                                 break
                             quote = currency_broker.dhan_broker.get_latest_quote(sym)
                             if not quote:
+                                logger.info(f"[CURRENCY] {sym}: skip — no quote")
                                 continue
                             price = float(quote.get("ltp", 0))
                             df = currency_broker.dhan_broker.get_historical_candles(
-                                sym, timeframe="1Hour", days=15
+                                sym, timeframe="1Hour", days=60
                             )
-                            min_bars = 20 if config.CURRENCY_PAPER else 30
+                            min_bars = 10 if config.CURRENCY_PAPER else 30
                             if df is None or len(df) < min_bars:
-                                logger.info(f"[CURRENCY] {sym}: skip — insufficient candles")
+                                # Paper: if we have a live LTP, allow a quote-only entry path
+                                # so FX is not permanently dead when history is thin.
+                                if (
+                                    config.CURRENCY_PAPER
+                                    and not config.CURRENCY_LIVE_CONFIRMED
+                                    and price > 0
+                                ):
+                                    logger.warning(
+                                        f"[CURRENCY] {sym}: thin candles "
+                                        f"({0 if df is None else len(df)}) — paper quote-only path"
+                                    )
+                                    sl = price * 0.998
+                                    tp = price * 1.003
+                                    currency_broker.place_buy_order(
+                                        sym, 1, price, stop_loss=sl, take_profit=tp
+                                    )
+                                else:
+                                    logger.info(
+                                        f"[CURRENCY] {sym}: skip — insufficient candles "
+                                        f"({0 if df is None else len(df)}<{min_bars})"
+                                    )
                                 continue
                             rsi, adx, sma_fast, sma_slow, atr = _calc_rsi_adx(df)
                             if config.CURRENCY_PAPER and not config.CURRENCY_LIVE_CONFIRMED:

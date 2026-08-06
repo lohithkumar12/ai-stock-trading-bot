@@ -30,6 +30,45 @@ _master_lock = threading.Lock()
 _last_download_time = 0.0
 CACHE_TTL_SEC = 86400.0  # Refresh scrip master once every 24h
 
+# Bot universe names → scrip-master underlying aliases
+_FUTURES_ALIASES: dict[str, list[str]] = {
+    "USDINR": ["USDINR", "USD-INR", "USD INR", "USD"],
+    "CRUDEOIL": ["CRUDEOIL", "CRUDE OIL", "CRUDE"],
+    "NATURALGAS": ["NATURALGAS", "NATURAL GAS", "NATGAS"],
+    "GOLD": ["GOLD"],
+    "SILVER": ["SILVER"],
+}
+_stale_reload_attempted: set[str] = set()
+
+
+def _futures_lookup_keys(symbol: str) -> list[str]:
+    sym = symbol.strip().upper()
+    keys = list(_FUTURES_ALIASES.get(sym, [sym]))
+    compact = sym.replace(" ", "").replace("-", "")
+    for extra in (sym, compact):
+        if extra and extra not in keys:
+            keys.append(extra)
+    out: list[str] = []
+    for k in keys:
+        if k and k not in out:
+            out.append(k)
+    return out
+
+
+def _collect_futures_items(symbol: str) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for key in _futures_lookup_keys(symbol):
+        for item in _master_futures.get(key) or []:
+            sid = str(item.get("security_id") or "")
+            if sid and sid in seen_ids:
+                continue
+            if sid:
+                seen_ids.add(sid)
+            items.append(item)
+    return items
+
+
 # Lot-size / segment metadata only. Placeholder security_ids are NEVER trusted
 # for live orders when the scrip master has loaded (see is_placeholder_security_id).
 STATIC_INSTRUMENT_DEFAULTS: dict[str, dict[str, Any]] = {
@@ -251,8 +290,15 @@ def load_dhan_scrip_master(force_download: bool = False) -> bool:
                     if inst in ("FUTCOM", "FUTCUR", "FUTIDX", "FUTSTK") and und:
                         futures.setdefault(und, []).append(info)
                         # Also key popular aliases
-                        if und == "CRUDE OIL":
+                        und_compact = und.replace(" ", "").replace("-", "")
+                        if und_compact and und_compact != und:
+                            futures.setdefault(und_compact, []).append(info)
+                        if und == "CRUDE OIL" or und_compact == "CRUDEOIL":
                             futures.setdefault("CRUDEOIL", []).append(info)
+                        if und_compact == "USDINR" or und in ("USD-INR", "USD INR", "USD"):
+                            futures.setdefault("USDINR", []).append(info)
+                        if und == "NATURAL GAS" or und_compact == "NATURALGAS":
+                            futures.setdefault("NATURALGAS", []).append(info)
 
                     # Options
                     if info["option_type"] in ("CE", "PE") and und:
@@ -331,10 +377,7 @@ def resolve_instrument_info(symbol: str, exchange_segment: str = "NSE") -> dict[
                 return dict(cached)
 
         # Futures underlyings (MCX / currency / index fut)
-        fut_key = sym_upper
-        items = _master_futures.get(fut_key)
-        if not items and seg_hint in ("MCX", "MCX_COMM", "NSE_CURR", "NSE_CURRENCY", "NSE_FNO"):
-            items = _master_futures.get(fut_key)
+        items = _collect_futures_items(sym_upper)
         if items:
             # Prefer exchange matching hint
             filtered = items
@@ -346,11 +389,53 @@ def resolve_instrument_info(symbol: str, exchange_segment: str = "NSE") -> dict[
                 ] or items
             pick = _pick_nearest_future(filtered)
             if pick:
-                return dict(pick)
+                exp = _parse_expiry(pick.get("expiry") or "")
+                # One forced master refresh if we only have expired currency/MCX contracts
+                if (
+                    exp
+                    and exp.date() < datetime.now().date()
+                    and seg_hint in ("NSE_CURR", "NSE_CURRENCY", "CURRENCY", "MCX", "MCX_COMM")
+                    and sym_upper not in _stale_reload_attempted
+                ):
+                    _stale_reload_attempted.add(sym_upper)
+                    logger.warning(
+                        f"[FEED] {sym_upper} nearest future expired ({pick.get('trading_symbol')}) "
+                        f"— forcing scrip master reload"
+                    )
+                    # Release lock before download (load acquires its own lock)
+                    pass
+                else:
+                    return dict(pick)
 
         # Index static known IDs from master equity/index map
         if cached:
             return dict(cached)
+
+    # Stale currency/MCX: reload master outside lock then retry once
+    if (
+        sym_upper in _stale_reload_attempted
+        and seg_hint in ("NSE_CURR", "NSE_CURRENCY", "CURRENCY", "MCX", "MCX_COMM")
+    ):
+        # Only trigger download if we just marked it and haven't reloaded yet —
+        # use a second marker
+        reload_key = f"{sym_upper}:reloaded"
+        if reload_key not in _stale_reload_attempted:
+            _stale_reload_attempted.add(reload_key)
+            try:
+                load_dhan_scrip_master(force_download=True)
+            except Exception as e:
+                logger.debug(f"[FEED] Forced master reload note: {e}")
+            with _master_lock:
+                items = _collect_futures_items(sym_upper)
+                if seg_hint in ("MCX", "MCX_COMM"):
+                    items = [i for i in items if i.get("exchange") == "MCX_COMM"] or items
+                elif seg_hint in ("NSE_CURR", "NSE_CURRENCY", "CURRENCY"):
+                    items = [
+                        i for i in items if i.get("exchange") in ("NSE_CURRENCY", "BSE_CURRENCY")
+                    ] or items
+                pick = _pick_nearest_future(items)
+                if pick:
+                    return dict(pick)
 
     static_info = STATIC_INSTRUMENT_DEFAULTS.get(sym_upper)
     if static_info:

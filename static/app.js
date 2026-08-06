@@ -516,9 +516,41 @@ async function fetchSegmentsStatus() {
         if (fxEl && data.segments.currency_fx) {
             fxEl.textContent = segLabel(data.segments.currency_fx);
         }
+
+        updateExpansionPositionsUI(data.expansion_positions || []);
     } catch (e) {
         console.debug("Segment status poll error:", e);
     }
+}
+
+function updateExpansionPositionsUI(rows) {
+    const tbody = document.getElementById("expansion-positions-tbody");
+    const countEl = document.getElementById("expansion-pos-count");
+    if (!tbody) return;
+    const list = Array.isArray(rows) ? rows : [];
+    if (countEl) countEl.textContent = `${list.length} Active`;
+    if (list.length === 0) {
+        tbody.innerHTML = `<tr><td colspan="7" class="empty-state">No F&O / MCX / FX positions.</td></tr>`;
+        return;
+    }
+    const fmt = (n) => {
+        const v = Number(n) || 0;
+        return "₹" + v.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    };
+    tbody.innerHTML = list.map((pos) => {
+        const plClass = (pos.unrealized_pl || 0) >= 0 ? "pl-positive" : "pl-negative";
+        const plSign = (pos.unrealized_pl || 0) >= 0 ? "+" : "";
+        return `
+            <tr>
+                <td>${pos.segment || ""}</td>
+                <td style="font-weight:700;">${pos.symbol || ""}</td>
+                <td>${pos.qty ?? 0}</td>
+                <td>${fmt(pos.avg_entry_price)}</td>
+                <td>${fmt(pos.current_price)}</td>
+                <td>${fmt(pos.market_value)}</td>
+                <td class="${plClass}">${plSign}${fmt(pos.unrealized_pl)} (${plSign}${pos.unrealized_plpc ?? 0}%)</td>
+            </tr>`;
+    }).join("");
 }
 
 // Global Poll Timers

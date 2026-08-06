@@ -209,6 +209,9 @@ class TestDhanExpansionProductionSuite(unittest.TestCase):
         self.assertIn("segments", data)
         self.assertIn("india_fno", data["segments"])
         self.assertIn("utilization", data["segments"]["india_fno"])
+        self.assertIn("positions", data["segments"]["india_fno"])
+        self.assertIn("expansion_positions", data)
+        self.assertIsInstance(data["expansion_positions"], list)
         feed = data["dhan_live_feed"]
         for key in ("enabled", "connected", "cached_symbols_count", "subscribed_count"):
             self.assertIn(key, feed)
