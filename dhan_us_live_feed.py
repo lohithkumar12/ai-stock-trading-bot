@@ -56,13 +56,105 @@ _SEED_SEC_MAP = {
     "10004393": "GOOGL",
     "10000496": "AMZN",
     "10007290": "NVDA",
+    "10006471": "META",
+    "10010311": "TSLA",
+    "10005648": "JPM",
+    "10010679": "V",
+    "10010532": "UNH",
 }
+
+
+def _parse_india_compatible_packet(first: int, data: bytes) -> dict | None:
+    """Some Global gateways reuse India MarketFeed binary layouts (first byte = type)."""
+    try:
+        if first == 2 and len(data) >= 16:
+            # Ticker: <BHBIfI
+            _t, _len, exch, sec_id, ltp, ltt = struct.unpack("<BHBIfI", data[0:16])
+            return {
+                "type": "Trade",
+                "exchange_segment": exch,
+                "security_id": sec_id,
+                "LTP": "{:.2f}".format(ltp),
+                "LTT": str(ltt),
+            }
+        if first == 4 and len(data) >= 50:
+            u = struct.unpack("<BHBIfHIfIIIffff", data[0:50])
+            return {
+                "type": "Trade",
+                "exchange_segment": u[2],
+                "security_id": u[3],
+                "LTP": "{:.2f}".format(u[4]),
+                "LTQ": u[5],
+                "volume": u[8],
+                "open": "{:.2f}".format(u[11]),
+                "close": "{:.2f}".format(u[12]),
+                "high": "{:.2f}".format(u[13]),
+                "low": "{:.2f}".format(u[14]),
+            }
+        if first == 8 and len(data) >= 62:
+            # Full packet — LTP at same offset as quote header
+            u = struct.unpack("<BHBIfHIfIIII", data[0:42])
+            return {
+                "type": "Trade",
+                "exchange_segment": u[2],
+                "security_id": u[3],
+                "LTP": "{:.2f}".format(u[4]),
+                "LTQ": u[5],
+                "volume": u[8],
+            }
+        if first == 6 and len(data) >= 16:
+            _t, _len, exch, sec_id, prev_close, prev_oi = struct.unpack(
+                "<BHBIfI", data[0:16]
+            )
+            return {
+                "type": "Previous Close",
+                "exchange_segment": exch,
+                "security_id": sec_id,
+                "prev_close": prev_close,
+                "prev_OI": prev_oi,
+            }
+    except (struct.error, ValueError, TypeError):
+        return None
+    return None
+
+
+def _parse_trade_partial(feed_self, packet: bytes) -> dict | None:
+    """Best-effort Trade parse when declared length is short (SDK/server mismatch)."""
+    if len(packet) >= 37:
+        try:
+            return feed_self.process_trade(packet)
+        except Exception:
+            pass
+    if len(packet) < 15:
+        return None
+    try:
+        if len(packet) >= 11:
+            exch_seg, scrip_id = feed_self._parse_header(packet)
+        else:
+            return None
+        ltp = struct.unpack("<f", packet[11:15])[0]
+        if not (0 < ltp < 1_000_000):
+            return None
+        out = {
+            "type": "Trade",
+            "exchange_segment": exch_seg,
+            "security_id": scrip_id,
+            "LTP": "{:.2f}".format(ltp),
+        }
+        if len(packet) >= 17:
+            out["LTQ"] = struct.unpack("<h", packet[15:17])[0]
+        if len(packet) >= 21:
+            out["volume"] = struct.unpack("<i", packet[17:21])[0]
+        return out
+    except (struct.error, ValueError, TypeError):
+        return None
 
 
 def _harden_global_stocks_feed(feed_cls_or_inst) -> None:
     """
     Patch GlobalStocksFeed.process_data so short/malformed frames are skipped
     instead of crashing the recv loop (SDK bug: body-only msg_length).
+    Also accept India-compatible first-byte packet layouts.
     """
     target = feed_cls_or_inst
     if getattr(target, "_ns_process_data_hardened", False):
@@ -80,6 +172,7 @@ def _harden_global_stocks_feed(feed_cls_or_inst) -> None:
             data = data.tobytes()
         if not isinstance(data, (bytes, bytearray)):
             return []
+        data = bytes(data)
 
         # Standalone error packet (MsgCode 50 at offset 0)
         if data[0] == 50:
@@ -88,6 +181,12 @@ def _harden_global_stocks_feed(feed_cls_or_inst) -> None:
             except Exception as e:
                 logger.debug(f"[US FEED] error packet parse: {e}")
                 return {"type": "Error", "message": str(e)}
+
+        # India-compatible layouts (first byte = packet type)
+        if data[0] in (2, 4, 6, 8):
+            india = _parse_india_compatible_packet(data[0], data)
+            if india is not None:
+                return india
 
         packets = []
         offset = 0
@@ -99,19 +198,43 @@ def _harden_global_stocks_feed(feed_cls_or_inst) -> None:
             take = msg_length if msg_length >= need else need
             if take <= 0:
                 break
+
             if offset + take > total:
-                # Incomplete frame — stop; next recv may continue
+                # Incomplete vs declared — try partial Trade on remainder
+                rem = bytes(data[offset:total])
+                if msg_code == 1:
+                    partial = _parse_trade_partial(self, rem)
+                    if partial is not None:
+                        packets.append(partial)
+                elif msg_code in _GS_PACKET_MIN_LEN and len(rem) >= 11:
+                    try:
+                        parsed = self.process_packet(msg_code, rem)
+                        if parsed is not None:
+                            packets.append(parsed)
+                    except Exception:
+                        pass
                 break
+
             packet = bytes(data[offset : offset + take])
             try:
                 parsed = self.process_packet(msg_code, packet)
                 if parsed is not None:
                     packets.append(parsed)
             except (struct.error, ValueError, TypeError) as pe:
-                logger.debug(
-                    f"[US FEED] skip packet code={msg_code} len={len(packet)} "
-                    f"declared={msg_length}: {pe}"
-                )
+                if msg_code == 1:
+                    partial = _parse_trade_partial(self, packet)
+                    if partial is not None:
+                        packets.append(partial)
+                    else:
+                        logger.debug(
+                            f"[US FEED] skip packet code={msg_code} len={len(packet)} "
+                            f"declared={msg_length}: {pe}"
+                        )
+                else:
+                    logger.debug(
+                        f"[US FEED] skip packet code={msg_code} len={len(packet)} "
+                        f"declared={msg_length}: {pe}"
+                    )
             offset += take
         if len(packets) == 1:
             return packets[0]
@@ -167,8 +290,11 @@ class DhanUSLiveFeedManager:
 
         self._is_connected = False
         self._last_heartbeat = 0.0
+        self._last_recv_at = 0.0
+        self._diag_frames = 0
         self._lock = threading.Lock()
         self._stop = False
+        self._run_error: BaseException | None = None
 
         self._ws_feed = None
         self._feed_thread = None
@@ -298,11 +424,46 @@ class DhanUSLiveFeedManager:
 
     def _on_ticks_callback(self, _ws, data):
         """GlobalStocksFeed on_message / on_ticks — may be dict or list."""
+        with self._lock:
+            self._last_recv_at = time.time()
+            self._diag_frames += 1
+            frame_n = self._diag_frames
+
+        if frame_n <= 25:
+            summary = data
+            if isinstance(data, list):
+                summary = f"list[{len(data)}] types={[ (x.get('type') if isinstance(x, dict) else type(x).__name__) for x in data[:5] ]}"
+            elif isinstance(data, dict):
+                summary = (
+                    f"type={data.get('type')} sec={data.get('security_id')} "
+                    f"LTP={data.get('LTP') or data.get('close') or data.get('prev_close')}"
+                )
+            elif data in ([], "", None):
+                summary = f"empty({data!r})"
+            logger.info(f"[US FEED] frame#{frame_n}: {summary}")
+
         if isinstance(data, list):
+            if not data and frame_n <= 10:
+                logger.info("[US FEED] empty parse result — binary layout may not match SDK")
             for item in data:
                 self._on_tick(item)
         else:
             self._on_tick(data)
+
+    def _on_ws_error(self, _ws, err):
+        self._run_error = err if isinstance(err, BaseException) else Exception(str(err))
+        if self._is_rate_limit_error(err):
+            with self._lock:
+                self._rate_limited_until = max(
+                    self._rate_limited_until,
+                    time.time() + _FEED_429_BACKOFF_SEC,
+                )
+            logger.warning(f"[US FEED] WS error rate-limit: {err}")
+            ws = self._ws_feed
+            if ws is not None:
+                self._close_ws(ws)
+        else:
+            logger.warning(f"[US FEED] WS error: {err}")
 
     def _on_tick(self, data):
         if not isinstance(data, dict):
@@ -314,7 +475,7 @@ class DhanUSLiveFeedManager:
             msg = data.get("message") or str(data)
             self._last_error = f"{err_code}: {msg}"
             logger.warning(f"[US FEED] Error packet: {self._last_error}")
-            if err_code in (805, 806) or self._is_rate_limit_error(msg):
+            if err_code in (805, 806, 807, 808, 809) or self._is_rate_limit_error(msg):
                 with self._lock:
                     self._rate_limited_until = max(
                         self._rate_limited_until,
@@ -333,7 +494,13 @@ class DhanUSLiveFeedManager:
         )
         with self._lock:
             sym = data.get("symbol") or self._sec_id_to_symbol.get(sec_id) or ""
+            # Any non-error packet proves the socket path works
+            self._last_recv_at = time.time()
+            self._is_connected = True
+
         if not sym:
+            if sec_id and self._diag_frames <= 30:
+                logger.info(f"[US FEED] tick for unmapped security_id={sec_id} keys={list(data.keys())}")
             return
 
         ltp_raw = (
@@ -341,6 +508,7 @@ class DhanUSLiveFeedManager:
             or data.get("last_price")
             or data.get("ltp")
             or data.get("close")
+            or data.get("prev_close")
         )
         try:
             ltp = float(ltp_raw) if ltp_raw is not None else 0.0
@@ -352,7 +520,7 @@ class DhanUSLiveFeedManager:
             open_p = float(data.get("open") or 0.0)
             high = float(data.get("high") or 0.0)
             low = float(data.get("low") or 0.0)
-            close = float(data.get("close") or 0.0)
+            close = float(data.get("close") or data.get("prev_close") or 0.0)
         except (TypeError, ValueError):
             pass
 
@@ -362,7 +530,7 @@ class DhanUSLiveFeedManager:
         except (TypeError, ValueError):
             volume = 0
 
-        # OHLC-only packets may not have LTP — use close
+        # OHLC / prev_close packets may not have LTP — use close
         if ltp <= 0 and close > 0:
             ltp = close
         if sym and ltp > 0:
@@ -424,82 +592,74 @@ class DhanUSLiveFeedManager:
 
                 ctx = DhanContext(cid, tok)
                 instruments = self._snapshot_instruments()
+                self._diag_frames = 0
+                self._run_error = None
                 self._ws_feed = GlobalStocksFeed(
                     ctx,
                     instruments=instruments,
                     auth_type=getattr(GlobalStocksFeed, "AUTH_SELF", 2),
                     on_ticks=self._on_ticks_callback,
+                    on_error=self._on_ws_error,
                 )
+                # Log raw binary for first frames (diagnose layout mismatches)
+                if hasattr(self._ws_feed, "get_instrument_data"):
+                    _orig_get = self._ws_feed.get_instrument_data
+
+                    async def _get_logged():
+                        raw = await self._ws_feed.ws.recv()
+                        with self._lock:
+                            n = self._diag_frames
+                        if n < 15:
+                            raw_b = raw if isinstance(raw, (bytes, bytearray)) else str(raw)[:80]
+                            if isinstance(raw_b, (bytes, bytearray)):
+                                logger.info(
+                                    f"[US FEED] raw#{n + 1} len={len(raw_b)} "
+                                    f"hex={raw_b[:32].hex()} first={raw_b[0] if raw_b else None}"
+                                )
+                            else:
+                                logger.info(f"[US FEED] raw#{n + 1} text={raw_b!r}")
+                        self._ws_feed.data = self._ws_feed.process_data(raw)
+                        return self._ws_feed.data
+
+                    self._ws_feed.get_instrument_data = _get_logged  # type: ignore[method-assign]
+                    _ = _orig_get  # keep reference silence
+
                 logger.info(
                     f"[US FEED] GlobalStocksFeed connecting with "
                     f"{len(instruments)} instrument(s)..."
                 )
                 hb_before = self._last_heartbeat
 
-                # Connect once, then poll packets under our backoff control
-                # (avoid SDK run()'s 1s reconnect storm on 429).
-                if hasattr(self._ws_feed, "run_forever"):
+                # Use run() so the asyncio loop stays alive (keepalive).
+                # run_forever()+get_data() destroys keepalive tasks and drops the socket.
+                if hasattr(self._ws_feed, "run"):
+                    logger.info("[US FEED] GlobalStocksFeed run() — receiving ticks")
+                    self._ws_feed.run()
+                elif hasattr(self._ws_feed, "run_forever"):
                     self._ws_feed.run_forever()
-                elif hasattr(self._ws_feed, "connect"):
-                    self._ws_feed.connect()
-                else:
-                    logger.error("[US FEED] GlobalStocksFeed has no run_forever/connect")
-                    break
-
-                logger.info("[US FEED] GlobalStocksFeed connected — receiving ticks")
-                consecutive_parse_errors = 0
-                while not self._stop:
-                    with self._lock:
-                        if time.time() < self._rate_limited_until:
-                            was_rate_limited = True
-                            break
-                    try:
-                        data = self._ws_feed.get_data()
-                        consecutive_parse_errors = 0
-                        self._on_ticks_callback(self._ws_feed, data)
-                    except (struct.error, ValueError) as parse_err:
-                        # Malformed frame — keep socket; do not reconnect storm
-                        consecutive_parse_errors += 1
-                        if consecutive_parse_errors <= 3 or consecutive_parse_errors % 50 == 0:
-                            logger.warning(
-                                f"[US FEED] Skipping malformed packet "
-                                f"({consecutive_parse_errors}x): {parse_err}"
-                            )
-                        if consecutive_parse_errors > 200:
-                            logger.warning(
-                                "[US FEED] Too many malformed packets — reconnecting"
-                            )
-                            break
-                        continue
-                    except Exception as recv_err:
-                        if self._is_rate_limit_error(recv_err):
-                            was_rate_limited = True
-                            raise
-                        err_l = str(recv_err).lower()
-                        # Connection truly dead
-                        if any(
-                            k in err_l
-                            for k in (
-                                "closed",
-                                "disconnect",
-                                "1000",
-                                "1001",
-                                "1006",
-                                "no close frame",
-                                "connection reset",
-                            )
-                        ):
+                    while not self._stop:
+                        with self._lock:
+                            if time.time() < self._rate_limited_until:
+                                was_rate_limited = True
+                                break
+                        try:
+                            data = self._ws_feed.get_data()
+                            self._on_ticks_callback(self._ws_feed, data)
+                        except Exception as recv_err:
+                            if self._is_rate_limit_error(recv_err):
+                                was_rate_limited = True
+                                raise
                             logger.warning(
                                 f"[US FEED] GlobalStocksFeed recv ended: {recv_err}"
                             )
                             break
-                        consecutive_parse_errors += 1
-                        logger.warning(
-                            f"[US FEED] GlobalStocksFeed recv note: {recv_err}"
-                        )
-                        if consecutive_parse_errors > 20:
-                            break
-                        continue
+                else:
+                    logger.error("[US FEED] GlobalStocksFeed has no run/run_forever")
+                    break
+
+                if self._run_error and self._is_rate_limit_error(self._run_error):
+                    was_rate_limited = True
+                    raise self._run_error
 
                 had_ticks = self._last_heartbeat > hb_before
                 if had_ticks:
@@ -584,12 +744,17 @@ class DhanUSLiveFeedManager:
                 return dict(cached)
             return None
 
-    def _build_instrument_tuple(self, sec_id: str) -> tuple | None:
+    def _build_instrument_tuple(self, sec_id: str) -> list[tuple]:
+        """Trade + OHLC subscriptions for one SCRIP_CODE."""
         GlobalStocksFeed = _import_global_stocks_feed()
         if GlobalStocksFeed is None:
-            return None
-        mode = getattr(GlobalStocksFeed, "SubscribeTrade", 15)
-        return (GlobalStocksFeed.INX_EQ, str(sec_id), mode)
+            return []
+        trade = getattr(GlobalStocksFeed, "SubscribeTrade", 15)
+        ohlc = getattr(GlobalStocksFeed, "SubscribeOHLC", 17)
+        return [
+            (GlobalStocksFeed.INX_EQ, str(sec_id), trade),
+            (GlobalStocksFeed.INX_EQ, str(sec_id), ohlc),
+        ]
 
     def subscribe_symbol(self, symbol: str) -> bool:
         """Subscribe a US ticker using SCRIP_CODE from us_instruments master."""
@@ -608,17 +773,18 @@ class DhanUSLiveFeedManager:
                     self._subscribed_symbols.add(symbol)
                 return False
 
-            instr = self._build_instrument_tuple(sec_id)
-            if instr is None:
+            instrs = self._build_instrument_tuple(sec_id)
+            if not instrs:
                 return False
 
             with self._lock:
                 self._subscribed_symbols.add(symbol)
                 self._sec_id_to_symbol[str(sec_id)] = symbol
-                if instr not in self._instrument_tuples:
-                    self._instrument_tuples.append(instr)
+                for instr in instrs:
+                    if instr not in self._instrument_tuples:
+                        self._instrument_tuples.append(instr)
 
-            pushed = self._push_subscribe([instr])
+            pushed = self._push_subscribe(instrs)
             logger.info(
                 f"[US FEED] Subscribed {symbol} (INX_EQ:{sec_id}) socket_push={pushed}"
             )
@@ -659,7 +825,13 @@ class DhanUSLiveFeedManager:
         with self._lock:
             if not self.enabled:
                 return False
-            return self._is_connected and (time.time() - self._last_heartbeat < 60.0)
+            # Quote heartbeat OR recent raw frame (socket alive even before LTP map)
+            now = time.time()
+            if self._last_heartbeat > 0 and (now - self._last_heartbeat < 60.0):
+                return True
+            if self._last_recv_at > 0 and (now - self._last_recv_at < 90.0):
+                return True
+            return False
 
     def status_summary(self) -> dict:
         connected = self.is_connected()
@@ -676,17 +848,21 @@ class DhanUSLiveFeedManager:
                 "connected": connected,
                 "mode": (
                     "websocket_live"
-                    if connected
+                    if connected and self._last_heartbeat > 0
                     else (
-                        "sdk_missing"
-                        if self._want_live and not self._sdk_available
+                        "websocket_connected"
+                        if connected
                         else (
-                            "waiting_token"
-                            if self._want_live and not self.access_token
+                            "sdk_missing"
+                            if self._want_live and not self._sdk_available
                             else (
-                                "reconnect"
-                                if self.enabled
-                                else "rest_yahoo_fallback"
+                                "waiting_token"
+                                if self._want_live and not self.access_token
+                                else (
+                                    "reconnect"
+                                    if self.enabled
+                                    else "rest_yahoo_fallback"
+                                )
                             )
                         )
                     )

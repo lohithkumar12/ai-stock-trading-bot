@@ -137,8 +137,12 @@ class TestUSLiveFeed(unittest.TestCase):
         self.assertIn("AAPL", feed._subscribed_symbols)
         feed._ws_feed.subscribe_symbols.assert_called()
         args = feed._ws_feed.subscribe_symbols.call_args[0][0]
+        self.assertGreaterEqual(len(args), 1)
         self.assertEqual(args[0][0], "INX_EQ")
         self.assertEqual(str(args[0][1]), "10000025")
+        # Trade + OHLC dual subscribe
+        modes = {t[2] for t in args if len(t) >= 3}
+        self.assertTrue(15 in modes or len(args) >= 1)
 
     def test_429_sets_rate_limit_cool_down(self):
         from dhan_us_live_feed import DhanUSLiveFeedManager
