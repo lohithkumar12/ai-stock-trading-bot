@@ -20,9 +20,11 @@ Env (see config.py):
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import pandas as pd
 import pyotp
@@ -81,6 +83,13 @@ MARKETFEED_COOLDOWN_SEC = 90.0
 # Chunk intraday history requests (API can reject very wide ranges).
 INTRADAY_CHUNK_DAYS = 30
 
+TOKEN_CACHE_PATH = Path(
+    os.getenv(
+        "DHAN_TOKEN_CACHE_PATH",
+        str(Path(__file__).resolve().parent / "dhan_access_token.cache"),
+    )
+).expanduser().resolve()
+
 _shared_broker: "DhanBroker | None" = None
 _shared_lock = threading.Lock()
 
@@ -107,7 +116,7 @@ class DhanBroker:
 
     def __init__(self, auto_login: bool = True):
         self.client_id = config.DHAN_CLIENT_ID
-        self.access_token = config.DHAN_ACCESS_TOKEN
+        self.access_token = config.DHAN_ACCESS_TOKEN or self._load_cached_token()
         self.pin = config.DHAN_PIN
         self.totp_secret = config.DHAN_TOTP_SECRET
         self.api_key = config.DHAN_API_KEY
@@ -134,6 +143,34 @@ class DhanBroker:
     # -----------------------------------------------------------------------
     # Authentication
     # -----------------------------------------------------------------------
+    @staticmethod
+    def _load_cached_token() -> str:
+        try:
+            if TOKEN_CACHE_PATH.exists():
+                tok = TOKEN_CACHE_PATH.read_text(encoding="utf-8").strip()
+                if tok:
+                    logger.info(f"[AUTH] Loaded cached Dhan access token from {TOKEN_CACHE_PATH.name}")
+                    return tok
+        except Exception as e:
+            logger.debug(f"[AUTH] Token cache read skip: {e}")
+        return ""
+
+    def _persist_token(self, token: str) -> None:
+        try:
+            TOKEN_CACHE_PATH.write_text(token.strip(), encoding="utf-8")
+        except Exception as e:
+            logger.debug(f"[AUTH] Token cache write skip: {e}")
+
+    def _sync_live_feed_credentials(self) -> None:
+        """Push latest access token into the paid Data API WebSocket feed."""
+        if not config.DHAN_LIVE_WEBSOCKET:
+            return
+        try:
+            feed = get_live_feed_manager()
+            feed.update_credentials(self.client_id, self.access_token, reconnect=True)
+        except Exception as e:
+            logger.debug(f"[AUTH] Live feed credential sync note: {e}")
+
     def _build_client(self, access_token: str) -> dhanhq:
         ctx = DhanContext(self.client_id, access_token)
         return dhanhq(ctx)
@@ -143,7 +180,7 @@ class DhanBroker:
         return pyotp.TOTP(secret).now()
 
     def _refresh_access_token(self) -> str | None:
-        """Generate a fresh 24h access token via PIN + TOTP."""
+        """Generate a fresh 24h access token via PIN + TOTP (paid Data API uses same token)."""
         if not (self.client_id and self.pin and self.totp_secret):
             return None
         try:
@@ -156,7 +193,8 @@ class DhanBroker:
                 if not token and isinstance(data, dict):
                     token = data.get("accessToken") or data.get("access_token")
             if token:
-                logger.info("Dhan access token refreshed via PIN/TOTP")
+                logger.info("[AUTH] Dhan access token refreshed via PIN/TOTP")
+                self._persist_token(str(token))
                 return str(token)
             self.last_error = f"Dhan token refresh failed: {resp}"
             logger.error(self.last_error)
@@ -174,14 +212,11 @@ class DhanBroker:
                     self._logged_in = False
                     return False
 
-                token = self.access_token
-                need_refresh = not token
-                if self._session_time and token:
-                    age = datetime.now() - self._session_time
-                    if age > timedelta(hours=TOKEN_REFRESH_HOURS):
-                        need_refresh = True
+                token = self.access_token or self._load_cached_token()
 
-                if need_refresh and self.pin and self.totp_secret:
+                # Prefer a fresh PIN/TOTP token whenever credentials are available.
+                # Avoids stuck expired .env tokens after 24h.
+                if self.pin and self.totp_secret:
                     refreshed = self._refresh_access_token()
                     if refreshed:
                         token = refreshed
@@ -202,11 +237,11 @@ class DhanBroker:
                 funds = self.dhan.get_fund_limits()
                 if isinstance(funds, dict) and funds.get("status") == "failure":
                     remarks = funds.get("remarks") or funds.get("message") or funds
-                    # Stale token — try one PIN/TOTP refresh
                     if self.pin and self.totp_secret:
                         refreshed = self._refresh_access_token()
                         if refreshed:
                             self.access_token = refreshed
+                            token = refreshed
                             self.dhan = self._build_client(refreshed)
                             funds = self.dhan.get_fund_limits()
                     if isinstance(funds, dict) and funds.get("status") == "failure":
@@ -215,10 +250,13 @@ class DhanBroker:
                         self._logged_in = False
                         return False
 
+                self.access_token = token
+                self._persist_token(token)
                 self._session_time = datetime.now()
                 self._logged_in = True
                 self.last_error = ""
                 logger.info(f"Dhan LOGIN SUCCESS | Client: {self.client_id}")
+                self._sync_live_feed_credentials()
                 return True
 
             except Exception as e:

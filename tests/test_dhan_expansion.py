@@ -118,6 +118,13 @@ class TestDhanExpansionProductionSuite(unittest.TestCase):
         summary = feed.status_summary()
         self.assertIn("subscribed_count", summary)
         self.assertIn("order_updates_received", summary)
+        self.assertIn("mode", summary)
+
+        # Paid Data API: broker-refreshed token must update feed credentials
+        feed.update_credentials("1112996229", "fresh-token-xyz", reconnect=False)
+        self.assertEqual(feed.client_id, "1112996229")
+        self.assertEqual(feed.access_token, "fresh-token-xyz")
+        self.assertTrue(feed.enabled)
 
     def test_r4_live_fno_refuses_invented_premiums(self):
         """R4 & Defect 3: Verify live F&O rejects order when live option chain LTP is missing."""

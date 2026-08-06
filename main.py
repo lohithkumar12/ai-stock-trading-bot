@@ -688,12 +688,31 @@ def run_bot():
     except Exception as e:
         logger.warning(f"Dhan Scrip Master initialization warning: {e}")
 
+    # Authenticate Dhan first so PIN/TOTP refreshes the access token used by
+    # the paid ₹499 Live Market Feed (WebSocket) before we subscribe.
+    if config.INDIA_BROKER == "dhan" and config.DHAN_CONFIGURED:
+        try:
+            from india_client import get_shared_india_broker
+
+            india_auth = get_shared_india_broker(auto_login=True)
+            if getattr(india_auth, "is_logged_in", False):
+                logger.info(
+                    "[FEED] Dhan login OK — Live Data API credentials synced to WebSocket"
+                )
+            else:
+                logger.warning(
+                    "[FEED] Dhan login failed before Live Feed: %s",
+                    getattr(india_auth, "last_error", "unknown"),
+                )
+        except Exception as auth_e:
+            logger.warning(f"[FEED] Pre-feed Dhan login warning: {auth_e}")
+
     # Subscribe active universes to Live WebSocket feed
     try:
         from dhan_live_feed import get_live_feed_manager
 
         feed_mgr = get_live_feed_manager()
-        if feed_mgr.enabled:
+        if feed_mgr.enabled or getattr(feed_mgr, "_want_live", False):
             n = 0
             n += feed_mgr.subscribe_universe(config.INDIA_STOCK_UNIVERSE, "NSE_EQ")
             if config.INDIA_FNO_ENABLED:
@@ -705,7 +724,8 @@ def run_bot():
             # US Global: MarketFeed is India/MCX only — REST/Yahoo fallback documented in status
             logger.info(
                 f"[FEED] Subscribed {n} instruments across enabled universes "
-                f"(US uses REST/Yahoo fallback)"
+                f"(US uses REST/Yahoo fallback) | feed_enabled={feed_mgr.enabled} "
+                f"connected={feed_mgr.is_connected()}"
             )
         else:
             logger.info("[FEED] Live WebSocket disabled — REST quote mode")

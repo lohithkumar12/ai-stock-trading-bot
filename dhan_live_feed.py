@@ -75,9 +75,12 @@ class DhanLiveFeedManager:
     """
 
     def __init__(self):
-        self.client_id = config.DHAN_CLIENT_ID
-        self.access_token = config.DHAN_ACCESS_TOKEN
-        self.enabled = config.DHAN_LIVE_WEBSOCKET and bool(self.client_id and self.access_token)
+        self.client_id = (config.DHAN_CLIENT_ID or "").strip()
+        self.access_token = (config.DHAN_ACCESS_TOKEN or "").strip()
+        # Want live feed whenever the flag + client id are set; token may arrive
+        # after PIN/TOTP login (paid ₹499 Data API uses the same access token).
+        self._want_live = bool(config.DHAN_LIVE_WEBSOCKET and self.client_id)
+        self.enabled = bool(self._want_live and self.access_token)
 
         self._quote_cache: dict[str, dict[str, Any]] = {}
         self._order_updates: list[dict[str, Any]] = []
@@ -99,18 +102,83 @@ class DhanLiveFeedManager:
         if self.enabled:
             logger.info("[FEED] Initializing DhanHQ WebSocket Market Feed & Order Update Manager...")
             self._start_threads()
+        elif self._want_live:
+            logger.info(
+                "[FEED] Live Data API waiting for access token "
+                "(broker PIN/TOTP login will connect the WebSocket)."
+            )
         else:
             logger.info("[FEED] Dhan Live WebSocket Feed disabled or credentials missing.")
 
+    def update_credentials(
+        self,
+        client_id: str,
+        access_token: str,
+        reconnect: bool = True,
+    ) -> None:
+        """
+        Apply broker-refreshed Client ID + access token to the paid Data API feed.
+        Starts threads on first valid token; forces reconnect when token changes.
+        """
+        client_id = (client_id or "").strip()
+        access_token = (access_token or "").strip()
+        if not client_id or not access_token:
+            return
+
+        with self._lock:
+            changed = (
+                client_id != self.client_id or access_token != self.access_token
+            )
+            self.client_id = client_id
+            self.access_token = access_token
+            self._want_live = bool(config.DHAN_LIVE_WEBSOCKET and self.client_id)
+            was_enabled = self.enabled
+            self.enabled = bool(self._want_live and self.access_token)
+
+        if not self.enabled:
+            return
+
+        threads_alive = (
+            self._feed_thread is not None and self._feed_thread.is_alive()
+        )
+        if not was_enabled or not threads_alive:
+            self._stop = False
+            logger.info(
+                "[FEED] Connecting paid Live Market Feed with refreshed access token..."
+            )
+            self._start_threads()
+        elif reconnect and changed:
+            logger.info("[FEED] Access token updated — reconnecting Live Market Feed...")
+            self._force_reconnect()
+
+    def _force_reconnect(self) -> None:
+        """Close the open MarketFeed socket so the loop reconnects with new creds."""
+        with self._lock:
+            ws = self._ws_feed
+            self._is_connected = False
+        if ws is None:
+            return
+        for method_name in ("close", "disconnect", "stop", "logout"):
+            method = getattr(ws, method_name, None)
+            if callable(method):
+                try:
+                    method()
+                    return
+                except Exception as e:
+                    logger.debug(f"[FEED] {method_name} during reconnect: {e}")
+
     def _start_threads(self):
+        if self._feed_thread is not None and self._feed_thread.is_alive():
+            return
         self._feed_thread = threading.Thread(
             target=self._market_feed_loop, daemon=True, name="DhanLiveMarketFeed"
         )
         self._feed_thread.start()
-        self._order_thread = threading.Thread(
-            target=self._order_update_loop, daemon=True, name="DhanOrderUpdateFeed"
-        )
-        self._order_thread.start()
+        if self._order_thread is None or not self._order_thread.is_alive():
+            self._order_thread = threading.Thread(
+                target=self._order_update_loop, daemon=True, name="DhanOrderUpdateFeed"
+            )
+            self._order_thread.start()
 
     def _on_tick(self, data):
         if not isinstance(data, dict):
@@ -147,11 +215,17 @@ class DhanLiveFeedManager:
         """Reconnect-with-backoff loop for MarketFeed WebSocket."""
         backoff = 1.0
         while not self._stop:
+            with self._lock:
+                cid = self.client_id
+                tok = self.access_token
+            if not (cid and tok):
+                time.sleep(2.0)
+                continue
             try:
                 from dhanhq import DhanContext
                 from dhanhq.marketfeed import MarketFeed
 
-                ctx = DhanContext(self.client_id, self.access_token)
+                ctx = DhanContext(cid, tok)
                 instruments = self._snapshot_instruments()
                 self._ws_feed = MarketFeed(
                     ctx,
@@ -163,6 +237,7 @@ class DhanLiveFeedManager:
                     f"[FEED] MarketFeed connecting with {len(instruments)} instrument(s)..."
                 )
                 self._reconnect_attempts = 0
+                backoff = 1.0
                 if hasattr(self._ws_feed, "run_forever"):
                     self._ws_feed.run_forever()
                 elif hasattr(self._ws_feed, "connect"):
@@ -188,6 +263,12 @@ class DhanLiveFeedManager:
     def _order_update_loop(self):
         backoff = 1.0
         while not self._stop:
+            with self._lock:
+                cid = self.client_id
+                tok = self.access_token
+            if not (cid and tok):
+                time.sleep(2.0)
+                continue
             try:
                 from dhanhq.orderupdate import OrderUpdate
 
@@ -195,7 +276,7 @@ class DhanLiveFeedManager:
                     logger.info(f"[FEED] [ORDER UPDATE] {update_payload}")
                     self.push_order_update(update_payload)
 
-                order_client = OrderUpdate(self.client_id, self.access_token)
+                order_client = OrderUpdate(cid, tok)
                 self._order_ws = order_client
                 if hasattr(order_client, "connect_order_update"):
                     order_client.connect_order_update(on_order_update)
@@ -367,6 +448,11 @@ class DhanLiveFeedManager:
             return {
                 "enabled": self.enabled,
                 "connected": connected,
+                "mode": "websocket_live" if connected else (
+                    "waiting_token" if self._want_live and not self.access_token
+                    else ("reconnect" if self.enabled else "rest_fallback")
+                ),
+                "has_access_token": bool(self.access_token),
                 "cached_symbols_count": len(self._quote_cache),
                 "subscribed_count": len(self._subscribed_symbols),
                 "instrument_tuples_count": len(self._instrument_tuples),
