@@ -161,13 +161,15 @@ class DhanBroker:
         except Exception as e:
             logger.debug(f"[AUTH] Token cache write skip: {e}")
 
-    def _sync_live_feed_credentials(self) -> None:
+    def _sync_live_feed_credentials(self, reconnect: bool = True) -> None:
         """Push latest access token into the paid Data API WebSocket feed."""
         if not config.DHAN_LIVE_WEBSOCKET:
             return
         try:
             feed = get_live_feed_manager()
-            feed.update_credentials(self.client_id, self.access_token, reconnect=True)
+            feed.update_credentials(
+                self.client_id, self.access_token, reconnect=reconnect
+            )
         except Exception as e:
             logger.debug(f"[AUTH] Live feed credential sync note: {e}")
 
@@ -213,10 +215,17 @@ class DhanBroker:
                     return False
 
                 token = self.access_token or self._load_cached_token()
+                prev_token = token
 
-                # Prefer a fresh PIN/TOTP token whenever credentials are available.
-                # Avoids stuck expired .env tokens after 24h.
-                if self.pin and self.totp_secret:
+                # Refresh via PIN/TOTP only when missing or session aged — avoids
+                # minting a new JWT (and feed reconnect) on every login() call.
+                need_refresh = not token
+                if self._session_time and token:
+                    age = datetime.now() - self._session_time
+                    if age > timedelta(hours=TOKEN_REFRESH_HOURS):
+                        need_refresh = True
+
+                if need_refresh and self.pin and self.totp_secret:
                     refreshed = self._refresh_access_token()
                     if refreshed:
                         token = refreshed
@@ -256,7 +265,9 @@ class DhanBroker:
                 self._logged_in = True
                 self.last_error = ""
                 logger.info(f"Dhan LOGIN SUCCESS | Client: {self.client_id}")
-                self._sync_live_feed_credentials()
+                # Push credentials; only force socket reconnect if token changed
+                # and feed is down (see update_credentials).
+                self._sync_live_feed_credentials(reconnect=(token != prev_token))
                 return True
 
             except Exception as e:

@@ -24,6 +24,13 @@ logger = logging.getLogger(__name__)
 _feed_instance: "DhanLiveFeedManager | None" = None
 _feed_lock = threading.Lock()
 
+# Dhan allows few concurrent MarketFeed sockets per client; 429 means back off hard.
+_FEED_BACKOFF_START_SEC = 5.0
+_FEED_BACKOFF_MAX_SEC = 300.0  # 5 minutes
+_FEED_429_BACKOFF_SEC = 60.0
+_FEED_429_BACKOFF_MAX_SEC = 600.0  # 10 minutes
+_RECONNECT_DEBOUNCE_SEC = 45.0
+
 # Known index / equity seed tokens (overridden by scrip master on subscribe)
 _SEED_SEC_MAP = {
     "2885": "RELIANCE",
@@ -98,6 +105,9 @@ class DhanLiveFeedManager:
         self._feed_thread = None
         self._order_thread = None
         self._reconnect_attempts = 0
+        self._last_force_reconnect_at = 0.0
+        self._rate_limited_until = 0.0
+        self._connect_lock = threading.Lock()
 
         if self.enabled:
             logger.info("[FEED] Initializing DhanHQ WebSocket Market Feed & Order Update Manager...")
@@ -148,16 +158,32 @@ class DhanLiveFeedManager:
             )
             self._start_threads()
         elif reconnect and changed:
-            logger.info("[FEED] Access token updated — reconnecting Live Market Feed...")
-            self._force_reconnect()
+            # Keep an already-working socket; apply new token on natural reconnect.
+            # Only force-close when feed is down (avoids 429 reconnect storms).
+            if self.is_connected():
+                logger.info(
+                    "[FEED] Access token updated — keeping live socket; "
+                    "new token used on next reconnect"
+                )
+            else:
+                self._force_reconnect(reason="token_updated_while_down")
 
-    def _force_reconnect(self) -> None:
+    def _force_reconnect(self, reason: str = "manual") -> None:
         """Close the open MarketFeed socket so the loop reconnects with new creds."""
+        now = time.time()
+        if now - self._last_force_reconnect_at < _RECONNECT_DEBOUNCE_SEC:
+            logger.info(
+                f"[FEED] Skip force reconnect ({reason}) — debounced "
+                f"<{_RECONNECT_DEBOUNCE_SEC:.0f}s"
+            )
+            return
+        self._last_force_reconnect_at = now
         with self._lock:
             ws = self._ws_feed
             self._is_connected = False
         if ws is None:
             return
+        logger.info(f"[FEED] Force reconnect ({reason})")
         for method_name in ("close", "disconnect", "stop", "logout"):
             method = getattr(ws, method_name, None)
             if callable(method):
@@ -166,6 +192,11 @@ class DhanLiveFeedManager:
                     return
                 except Exception as e:
                     logger.debug(f"[FEED] {method_name} during reconnect: {e}")
+
+    @staticmethod
+    def _is_rate_limit_error(err: BaseException | str) -> bool:
+        msg = str(err).lower()
+        return "429" in msg or "too many requests" in msg or "rate limit" in msg
 
     def _start_threads(self):
         if self._feed_thread is not None and self._feed_thread.is_alive():
@@ -212,15 +243,34 @@ class DhanLiveFeedManager:
             return []
 
     def _market_feed_loop(self):
-        """Reconnect-with-backoff loop for MarketFeed WebSocket."""
-        backoff = 1.0
+        """Reconnect-with-backoff loop for MarketFeed WebSocket (one socket at a time)."""
+        backoff = _FEED_BACKOFF_START_SEC
         while not self._stop:
             with self._lock:
                 cid = self.client_id
                 tok = self.access_token
+                rate_until = self._rate_limited_until
             if not (cid and tok):
                 time.sleep(2.0)
                 continue
+
+            # Honour Dhan 429 cool-down before opening another socket
+            wait_rate = rate_until - time.time()
+            if wait_rate > 0:
+                logger.warning(
+                    f"[FEED] Rate-limited by Dhan — waiting {wait_rate:.0f}s "
+                    f"before next MarketFeed connect"
+                )
+                time.sleep(min(wait_rate, 30.0))
+                continue
+
+            # Serialize connects so we never open two MarketFeed sockets
+            if not self._connect_lock.acquire(blocking=False):
+                time.sleep(2.0)
+                continue
+
+            had_ticks = False
+            was_rate_limited = False
             try:
                 from dhanhq import DhanContext
                 from dhanhq.marketfeed import MarketFeed
@@ -236,8 +286,7 @@ class DhanLiveFeedManager:
                 logger.info(
                     f"[FEED] MarketFeed connecting with {len(instruments)} instrument(s)..."
                 )
-                self._reconnect_attempts = 0
-                backoff = 1.0
+                hb_before = self._last_heartbeat
                 if hasattr(self._ws_feed, "run_forever"):
                     self._ws_feed.run_forever()
                 elif hasattr(self._ws_feed, "connect"):
@@ -245,23 +294,50 @@ class DhanLiveFeedManager:
                 else:
                     logger.error("[FEED] MarketFeed has no run_forever/connect")
                     break
+                had_ticks = self._last_heartbeat > hb_before
                 # run_forever returned → disconnected
                 logger.warning("[FEED] MarketFeed disconnected — scheduling reconnect")
+                if had_ticks:
+                    backoff = _FEED_BACKOFF_START_SEC
+                    self._reconnect_attempts = 0
             except Exception as wse:
-                logger.warning(f"[FEED] MarketFeed error ({wse}) — reconnect in {backoff:.0f}s")
+                if self._is_rate_limit_error(wse):
+                    was_rate_limited = True
+                    backoff = max(backoff, _FEED_429_BACKOFF_SEC)
+                    backoff = min(backoff, _FEED_429_BACKOFF_MAX_SEC)
+                    with self._lock:
+                        self._rate_limited_until = time.time() + backoff
+                    logger.warning(
+                        f"[FEED] MarketFeed HTTP 429 from Dhan — cool-down {backoff:.0f}s "
+                        f"(do not open another socket for this Client ID)"
+                    )
+                else:
+                    logger.warning(
+                        f"[FEED] MarketFeed error ({wse}) — reconnect in {backoff:.0f}s"
+                    )
             finally:
                 with self._lock:
                     self._is_connected = False
                     self._ws_feed = None
                 self._reconnect_attempts += 1
+                try:
+                    self._connect_lock.release()
+                except RuntimeError:
+                    pass
 
             if self._stop:
                 break
             time.sleep(backoff)
-            backoff = min(backoff * 2.0, 60.0)
+            if was_rate_limited:
+                backoff = min(backoff * 1.5, _FEED_429_BACKOFF_MAX_SEC)
+            elif not had_ticks:
+                backoff = min(
+                    max(backoff, _FEED_BACKOFF_START_SEC) * 2.0,
+                    _FEED_BACKOFF_MAX_SEC,
+                )
 
     def _order_update_loop(self):
-        backoff = 1.0
+        backoff = _FEED_BACKOFF_START_SEC
         while not self._stop:
             with self._lock:
                 cid = self.client_id
@@ -285,11 +361,16 @@ class DhanLiveFeedManager:
                 else:
                     logger.debug("[FEED] OrderUpdate connect method not found")
                     return
-                backoff = 1.0
+                backoff = _FEED_BACKOFF_START_SEC
             except Exception as oe:
-                logger.debug(f"[FEED] OrderUpdate WS: {oe}")
+                if self._is_rate_limit_error(oe):
+                    backoff = max(backoff, _FEED_429_BACKOFF_SEC)
+                    backoff = min(backoff * 1.5, _FEED_429_BACKOFF_MAX_SEC)
+                    logger.warning(f"[FEED] OrderUpdate 429 — cool-down {backoff:.0f}s")
+                else:
+                    logger.debug(f"[FEED] OrderUpdate WS: {oe}")
             time.sleep(backoff)
-            backoff = min(backoff * 2.0, 60.0)
+            backoff = min(max(backoff, _FEED_BACKOFF_START_SEC) * 2.0, _FEED_BACKOFF_MAX_SEC)
 
     def update_quote(
         self,
@@ -453,6 +534,11 @@ class DhanLiveFeedManager:
                     else ("reconnect" if self.enabled else "rest_fallback")
                 ),
                 "has_access_token": bool(self.access_token),
+                "rate_limited_for_sec": (
+                    round(max(0.0, self._rate_limited_until - time.time()), 1)
+                    if self._rate_limited_until > time.time()
+                    else 0
+                ),
                 "cached_symbols_count": len(self._quote_cache),
                 "subscribed_count": len(self._subscribed_symbols),
                 "instrument_tuples_count": len(self._instrument_tuples),
