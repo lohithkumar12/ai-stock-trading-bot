@@ -383,7 +383,7 @@ async function fetchTrades() {
     const tbody = document.getElementById("trades-tbody");
     if (!tbody) return;
     try {
-        const res = await fetch(`/api/trades?market=${activeMarket}&limit=20`);
+        const res = await fetch(`/api/trades?market=${activeMarket}&limit=50`);
         if (!res.ok) return;
         const trades = await res.json();
         if (!trades.length) {
