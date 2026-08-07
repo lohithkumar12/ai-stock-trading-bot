@@ -29,6 +29,7 @@ class TestCoreBotLogic(unittest.TestCase):
         self.assertFalse(is_uptrend_df(df2, sma_len=200))
 
     def test_bot_state_signals_and_sod(self):
+        bot_state.reset_sod_for_tests()
         bot_state.publish_signals("US", [{"symbol": "SPY", "signal": "HOLD", "price": 1.0, "reason": "x"}])
         rows = bot_state.get_signals("US", max_age_sec=60)
         self.assertTrue(rows)
@@ -37,6 +38,12 @@ class TestCoreBotLogic(unittest.TestCase):
         self.assertEqual(bot_state.india_sod_equity(101000), sod)
         sod_us = bot_state.us_sod_equity(10000)
         self.assertEqual(bot_state.us_sod_equity(10500), sod_us)
+
+    def test_india_sod_rebases_on_large_deposit(self):
+        bot_state.reset_sod_for_tests()
+        self.assertEqual(bot_state.india_sod_equity(25_000), 25_000)
+        # ₹50k deposit → equity 75k should not look like +200% Daily P&L
+        self.assertEqual(bot_state.india_sod_equity(75_000), 75_000)
 
     def test_trend_strategy_snapshot_on_synthetic(self):
         rng = np.random.default_rng(0)

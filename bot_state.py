@@ -84,6 +84,44 @@ def get_health() -> dict:
         return h
 
 
+def reset_sod_for_tests() -> None:
+    """Clear SOD baselines (unit tests only)."""
+    with _lock:
+        _india_sod["date"] = None
+        _india_sod["equity"] = None
+        _us_sod["date"] = None
+        _us_sod["equity"] = None
+
+
+def _rebaseline_sod_if_needed(
+    market: str, stored: float, cur: float, sod: dict[str, Any]
+) -> None:
+    """
+    Adjust sticky SOD when equity jumps for non-trading reasons.
+
+    - Large drop (>15%): heal inflated marks / bad quotes
+    - Large rise (>15%): treat as deposit / fund transfer (not Daily P&L)
+    Normal trading moves stay sticky so Daily P&L still works.
+    """
+    if stored <= 0 or cur <= 0:
+        return
+    logger = __import__("logging").getLogger(__name__)
+    drop_pct = (stored - cur) / stored
+    rise_pct = (cur - stored) / stored
+    if drop_pct > 0.15:
+        logger.warning(
+            f"[{market}] Rebaselining start-of-day equity "
+            f"{stored:,.2f} → {cur:,.2f} (inflated mark heal)"
+        )
+        sod["equity"] = cur
+    elif rise_pct > 0.15:
+        logger.info(
+            f"[{market}] Rebaselining start-of-day equity "
+            f"{stored:,.2f} → {cur:,.2f} (deposit / funding detected)"
+        )
+        sod["equity"] = cur
+
+
 def india_sod_equity(current_equity: float) -> float:
     """Return start-of-day equity for India (sticky per calendar day)."""
     today = date.today().isoformat()
@@ -92,17 +130,12 @@ def india_sod_equity(current_equity: float) -> float:
             _india_sod["date"] = today
             _india_sod["equity"] = float(current_equity)
         else:
-            stored = float(_india_sod["equity"])
-            cur = float(current_equity)
-            # Heal inflated SOD from temporary bad marks (e.g. paper fallback prices).
-            # Only correct downward when gap is large (>15%).
-            if stored > 0 and cur > 0 and (stored - cur) / stored > 0.15:
-                logger = __import__("logging").getLogger(__name__)
-                logger.warning(
-                    f"[INDIA] Rebaselining start-of-day equity "
-                    f"Rs {stored:,.2f} → Rs {cur:,.2f} (inflated mark heal)"
-                )
-                _india_sod["equity"] = cur
+            _rebaseline_sod_if_needed(
+                "INDIA",
+                float(_india_sod["equity"]),
+                float(current_equity),
+                _india_sod,
+            )
         return float(_india_sod["equity"])
 
 
@@ -118,4 +151,11 @@ def us_sod_equity(current_equity: float) -> float:
         if _us_sod.get("date") != today_et or _us_sod.get("equity") is None:
             _us_sod["date"] = today_et
             _us_sod["equity"] = float(current_equity)
+        else:
+            _rebaseline_sod_if_needed(
+                "US",
+                float(_us_sod["equity"]),
+                float(current_equity),
+                _us_sod,
+            )
         return float(_us_sod["equity"])
