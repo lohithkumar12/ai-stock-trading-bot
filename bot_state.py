@@ -14,11 +14,14 @@ from typing import Any
 _lock = threading.Lock()
 
 _signals: dict[str, dict[str, Any]] = {}  # market -> {symbol: payload}
+_scout: dict[str, Any] = {}  # market -> near-setups blob (display only)
 _health: dict[str, Any] = {
     "us_last_cycle": None,
     "india_last_cycle": None,
+    "india_scout_last_cycle": None,
     "us_last_error": None,
     "india_last_error": None,
+    "india_scout_last_error": None,
     "alpaca_429_count": 0,
     "started_at": time.time(),
 }
@@ -49,8 +52,41 @@ def get_signals(market: str, max_age_sec: float = 600.0) -> list[dict] | None:
         return list(blob["list"])
 
 
+def publish_scout(market: str, items: list[dict], *, meta: dict | None = None) -> None:
+    """Publish Near Setups rows (close-but-not-confirmed; scout BUYs go through trade path)."""
+    key = market.upper()
+    with _lock:
+        _scout[key] = {
+            "updated_at": time.time(),
+            "list": list(items),
+            "meta": dict(meta or {}),
+            "trade_eligible": True,
+        }
+
+
+def get_scout(market: str, max_age_sec: float = 3600.0) -> dict | None:
+    """Return scout blob {list, meta, updated_at, trade_eligible} or None if stale/missing."""
+    key = market.upper()
+    with _lock:
+        blob = _scout.get(key)
+        if not blob:
+            return None
+        if time.time() - blob["updated_at"] > max_age_sec:
+            return None
+        return {
+            "list": list(blob["list"]),
+            "meta": dict(blob.get("meta") or {}),
+            "updated_at": blob["updated_at"],
+            "trade_eligible": bool(blob.get("trade_eligible", True)),
+        }
+
+
 def mark_cycle(market: str, error: str | None = None) -> None:
-    key = "us" if market.upper() == "US" else "india"
+    m = market.upper()
+    if m in ("INDIA_SCOUT", "SCOUT"):
+        key = "india_scout"
+    else:
+        key = "us" if m == "US" else "india"
     with _lock:
         _health[f"{key}_last_cycle"] = time.time()
         if error:
@@ -61,7 +97,11 @@ def mark_cycle(market: str, error: str | None = None) -> None:
 
 
 def mark_healthy(market: str) -> None:
-    key = "us" if market.upper() == "US" else "india"
+    m = market.upper()
+    if m in ("INDIA_SCOUT", "SCOUT"):
+        key = "india_scout"
+    else:
+        key = "us" if m == "US" else "india"
     with _lock:
         _health[f"{key}_last_cycle"] = time.time()
         _health[f"{key}_last_error"] = None
@@ -78,8 +118,12 @@ def get_health() -> dict:
         now = time.time()
         us_age = (now - h["us_last_cycle"]) if h.get("us_last_cycle") else None
         in_age = (now - h["india_last_cycle"]) if h.get("india_last_cycle") else None
+        sc_age = (
+            (now - h["india_scout_last_cycle"]) if h.get("india_scout_last_cycle") else None
+        )
         h["us_cycle_age_sec"] = round(us_age, 1) if us_age is not None else None
         h["india_cycle_age_sec"] = round(in_age, 1) if in_age is not None else None
+        h["india_scout_cycle_age_sec"] = round(sc_age, 1) if sc_age is not None else None
         h["uptime_sec"] = round(now - h.get("started_at", now), 1)
         return h
 

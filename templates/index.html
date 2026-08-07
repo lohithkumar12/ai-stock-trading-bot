@@ -101,6 +101,36 @@
                 </div>
             </section>
 
+            <section class="panel" id="scout-panel">
+                <div class="panel-header">
+                    <h3><i class="fa-solid fa-binoculars"></i> Near setups (scout)</h3>
+                    <span class="scout-watch-tag" title="Close but not confirmed — full scout signals auto-buy separately">CLOSE · NOT CONFIRMED</span>
+                </div>
+                <p class="scout-hint" id="scout-hint">
+                    Names close to trend_pullback entry (not confirmed yet).
+                    Scout universe (~Nifty 50) auto-buys on full signal under the same risk caps; core 12 stay on Strategy Scanner.
+                </p>
+                <div class="table-responsive">
+                    <table class="data-table scout-table">
+                        <thead>
+                            <tr>
+                                <th>Symbol</th>
+                                <th>Price</th>
+                                <th>RSI</th>
+                                <th>ADX</th>
+                                <th>Score</th>
+                                <th>Reason</th>
+                            </tr>
+                        </thead>
+                        <tbody id="scout-tbody">
+                            <tr>
+                                <td colspan="6" class="empty-state">Waiting for scout cycle…</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </section>
+
             <section class="panel">
                 <div class="panel-header">
                     <h3 id="positions-title"><i class="fa-solid fa-list-check"></i> Open Positions</h3>

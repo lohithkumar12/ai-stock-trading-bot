@@ -8,14 +8,16 @@ let scannerGeneration = 0;
 let liveAbort = null;
 let scannerAbort = null;
 
-document.addEventListener("DOMContentLoaded", () => {
+.document.addEventListener("DOMContentLoaded", () => {
     fetchLiveData();
     fetchScannerData();
+    fetchScoutData();
     fetchLogs();
     fetchTrades();
     fetchHealth();
     setInterval(fetchLiveData, 3000);
     setInterval(fetchScannerData, 60000);
+    setInterval(fetchScoutData, 60000);
     setInterval(fetchLogs, 5000);
     setInterval(fetchTrades, 15000);
     setInterval(fetchHealth, 10000);
@@ -59,15 +61,19 @@ function switchMarket(market) {
     const headerSub = document.getElementById("header-sub");
     const univSub = document.getElementById("kpi-universe-sub");
     const scannerTitle = document.getElementById("scanner-title");
+    const scoutPanel = document.getElementById("scout-panel");
 
     if (market === "US") {
         if (headerSub) headerSub.textContent = "US Trading Engine (Dhan Global)";
         if (univSub) univSub.textContent = "Universe: US Equities (Dhan Global)";
         if (scannerTitle) scannerTitle.innerHTML = `<i class="fa-solid fa-radar"></i> Strategy Scanner (US Equities)`;
+        if (scoutPanel) scoutPanel.style.display = "none";
     } else {
         if (headerSub) headerSub.textContent = "India Trading Engine";
         if (univSub) univSub.textContent = "Universe: Nifty Large-Caps (Dhan / NSE)";
         if (scannerTitle) scannerTitle.innerHTML = `<i class="fa-solid fa-radar"></i> Strategy Scanner (NSE)`;
+        if (scoutPanel) scoutPanel.style.display = "";
+        fetchScoutData();
     }
 
     clearMarketPanels();
@@ -93,6 +99,11 @@ function clearMarketPanels() {
         `<tr><td colspan="9" class="empty-state"><i class="fa-solid fa-spinner fa-spin"></i> Loading positions…</td></tr>`;
     document.getElementById("scanner-container").innerHTML =
         `<div class="loading-state"><i class="fa-solid fa-spinner fa-spin"></i> Loading scanner…</div>`;
+    const scoutBody = document.getElementById("scout-tbody");
+    if (scoutBody && activeMarket === "INDIA") {
+        scoutBody.innerHTML =
+            `<tr><td colspan="6" class="empty-state"><i class="fa-solid fa-spinner fa-spin"></i> Loading scout…</td></tr>`;
+    }
 }
 
 function fetchLiveData() {
@@ -108,6 +119,63 @@ function fetchScannerData() {
 function fetchCurrentTabData() {
     fetchLiveData();
     fetchScannerData();
+    if (activeMarket === "INDIA") fetchScoutData();
+}
+
+async function fetchScoutData() {
+    if (activeMarket !== "INDIA") return;
+    const tbody = document.getElementById("scout-tbody");
+    const hint = document.getElementById("scout-hint");
+    if (!tbody) return;
+    try {
+        const res = await fetch("/api/scout");
+        if (!res.ok) return;
+        const data = await res.json();
+        updateScoutUI(data);
+        if (hint && data.message) {
+            const meta = data.meta || {};
+            const scanned = meta.scanned != null ? ` · scanned ${meta.scanned}` : "";
+            const buys = meta.buys != null ? ` · buys ${meta.buys}` : "";
+            hint.textContent = `${data.message}${scanned}${buys}`;
+        }
+    } catch (err) {
+        console.error("Error fetching scout:", err);
+    }
+}
+
+function updateScoutUI(data) {
+    const tbody = document.getElementById("scout-tbody");
+    if (!tbody) return;
+    const items = (data && data.items) || [];
+    if (!data || data.enabled === false) {
+        tbody.innerHTML = `<tr><td colspan="6" class="empty-state">${(data && data.message) || "Scout disabled"}</td></tr>`;
+        return;
+    }
+    if (items.length === 0) {
+        tbody.innerHTML = `<tr><td colspan="6" class="empty-state">${(data && data.message) || "No near setups yet."}</td></tr>`;
+        return;
+    }
+    const fmt = currentFormatter();
+    tbody.innerHTML = items.map((row) => {
+        const score = Number(row.score) || 0;
+        const scoreClass = score >= 70 ? "scout-score-hot" : score >= 50 ? "scout-score-warm" : "";
+        const inTrade = row.in_core_universe || row.in_trade_universe
+            ? `<span class="scout-in-trade" title="Also on core Strategy Scanner">core</span>`
+            : `<span class="scout-ready" title="Scout-only — trade-eligible on full signal">scout</span>`;
+        const ready = "";
+        const rsi = row.rsi != null ? row.rsi : "—";
+        const adx = row.adx != null ? row.adx : "—";
+        const price = row.price != null && row.price > 0 ? fmt(row.price) : "—";
+        return `
+            <tr>
+                <td style="font-weight:700;">${row.symbol || ""} ${inTrade}${ready}</td>
+                <td class="mono">${price}</td>
+                <td class="mono">${rsi}</td>
+                <td class="mono">${adx}</td>
+                <td class="mono ${scoreClass}">${score.toFixed(1)}</td>
+                <td class="scout-reason">${row.reason || "—"}</td>
+            </tr>`;
+    }).join("");
 }
 
 async function fetchLive(gen, signal) {

@@ -453,6 +453,64 @@ def get_india_scanner():
         return jsonify(scanner_results)
 
 
+@app.route("/api/scout")
+def get_india_scout():
+    """Near Setups panel — close-but-not-confirmed. Scout BUYs run in background loop."""
+    if not config.INDIA_ENABLED:
+        return jsonify(
+            {
+                "trade_eligible": False,
+                "enabled": False,
+                "items": [],
+                "message": "India market disabled",
+            }
+        )
+
+    if not config.INDIA_SCOUT_ENABLED:
+        return jsonify(
+            {
+                "trade_eligible": False,
+                "enabled": False,
+                "items": [],
+                "message": "Scout disabled (INDIA_SCOUT_ENABLED=false)",
+            }
+        )
+
+    max_age = max(1800.0, float(config.INDIA_SCOUT_INTERVAL_SEC) * 3.0)
+    blob = bot_state.get_scout("INDIA", max_age_sec=max_age)
+    auto_buy = bool(config.INDIA_SCOUT_AUTO_BUY)
+    if not blob:
+        return jsonify(
+            {
+                "trade_eligible": True,
+                "auto_buy": auto_buy,
+                "enabled": True,
+                "items": [],
+                "meta": {},
+                "updated_at": None,
+                "message": (
+                    "No near setups yet — waiting for next scout cycle "
+                    f"(auto-buy {'ON' if auto_buy else 'OFF'} for full signals)"
+                ),
+            }
+        )
+
+    return jsonify(
+        {
+            "trade_eligible": True,
+            "auto_buy": auto_buy,
+            "enabled": True,
+            "items": blob["list"],
+            "meta": blob.get("meta") or {},
+            "updated_at": blob.get("updated_at"),
+            "message": (
+                "Near setups (close, not confirmed). "
+                f"Scout universe auto-buy is {'ON' if auto_buy else 'OFF'} for full signals."
+            ),
+        }
+    )
+
+
 @app.route("/api/close_position/<symbol>", methods=["POST"])
 def close_india_position(symbol):
     india_broker, _ = get_india_components()

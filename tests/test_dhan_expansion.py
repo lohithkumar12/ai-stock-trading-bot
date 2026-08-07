@@ -239,6 +239,36 @@ class TestDhanExpansionProductionSuite(unittest.TestCase):
         self.assertIn("us_global", data["segments"])
         self.assertIn("live_feed", data["segments"]["us_global"])
 
+    def test_india_scout_endpoint_near_panel(self):
+        """Near setups API lists close names; scout auto-buy is separate config."""
+        import bot_state
+
+        bot_state.publish_scout(
+            "INDIA",
+            [
+                {
+                    "symbol": "AXISBANK",
+                    "score": 66.0,
+                    "price": 1100.0,
+                    "rsi": 38.0,
+                    "adx": 22.0,
+                    "reason": "near SMA/EMA",
+                    "near_only": True,
+                    "would_buy": False,
+                }
+            ],
+            meta={"scanned": 1, "auto_buy": True, "trade_eligible": True},
+        )
+        client = app.test_client()
+        res = client.get("/api/scout")
+        self.assertEqual(res.status_code, 200)
+        data = res.get_json()
+        self.assertTrue(data.get("trade_eligible"))
+        self.assertTrue(data.get("enabled"))
+        self.assertIn("auto_buy", data)
+        self.assertEqual(data["items"][0]["symbol"], "AXISBANK")
+        self.assertFalse(data["items"][0].get("would_buy"))
+
     def test_price_guards_reject_fake_mcx_and_fallback(self):
         """Fake Rs1500 MCX marks and paper_fallback quotes must be rejected."""
         from price_guards import (
