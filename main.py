@@ -116,6 +116,121 @@ def _refresh_rs_filter(rs_filter, symbol_dfs: dict):
     if rs_filter is not None and config.USE_RELATIVE_STRENGTH:
         rs_filter.update_scores(symbol_dfs)
 
+
+def _india_try_buy(
+    *,
+    india_broker,
+    risk_mgr,
+    strategy,
+    symbol: str,
+    snap: dict,
+    atr,
+    current_equity: float,
+    account: dict,
+    current_positions: dict,
+    tradable_window: bool,
+    regime_ok: bool,
+    reason: str = "signal_buy",
+) -> bool:
+    """
+    Shared India equity BUY path (core + scout). Honors session/regime/risk caps.
+    Returns True if an order was accepted.
+    """
+    if not tradable_window:
+        logger.info(f"{symbol}: BUY skipped — outside tradable session window")
+        return False
+    if not regime_ok:
+        logger.info(f"{symbol}: BUY skipped — regime filter blocked entries")
+        return False
+    if risk_mgr.is_kill_switch_active:
+        logger.info(f"{symbol}: BUY skipped — kill switch active")
+        return False
+    if not risk_mgr.is_position_allowed(symbol, current_positions):
+        return False
+
+    quote = india_broker.get_latest_quote(symbol)
+    limit_price = None
+    if quote and quote.get("ltp"):
+        limit_price = float(quote["ltp"])
+    elif snap.get("price"):
+        limit_price = float(snap["price"])
+        logger.warning(
+            f"{symbol}: no live LTP — using signal candle close "
+            f"{limit_price:.2f} for entry"
+        )
+    if limit_price is None or limit_price <= 0:
+        logger.warning(f"{symbol}: BUY skipped — no usable price")
+        return False
+
+    sizing_equity = min(
+        current_equity,
+        float(account.get("available_cash") or current_equity),
+    )
+    sl = risk_mgr.get_stop_loss_price(limit_price, atr)
+    tp = risk_mgr.get_take_profit_price(limit_price, stop_loss_price=sl, atr=atr)
+    stop_dist = limit_price - sl
+    qty = risk_mgr.calculate_position_size(
+        sizing_equity, limit_price, stop_distance=stop_dist
+    )
+    if qty <= 0:
+        logger.warning(
+            f"{symbol}: BUY skipped — sized to 0 shares "
+            f"(price={limit_price:.2f}, equity={sizing_equity:.0f})"
+        )
+        return False
+
+    order_id = india_broker.place_buy_order(
+        symbol=symbol,
+        qty=qty,
+        limit_price=limit_price,
+        stop_loss_price=sl,
+        take_profit_price=tp,
+        atr=atr,
+    )
+    if not order_id:
+        logger.warning(
+            f"{symbol}: BUY order failed — "
+            f"{getattr(india_broker, 'last_error', 'unknown')}"
+        )
+        return False
+
+    risk_mgr.register_trade(symbol, limit_price, sl, atr)
+    trade_journal.record_entry(
+        "INDIA",
+        symbol,
+        qty,
+        limit_price,
+        stop_price=sl,
+        take_profit=tp,
+        reason=reason,
+        strategy=strategy.name,
+        meta={"atr": atr, "order_id": order_id},
+    )
+    alerts.trade_alert("INDIA", "BUY", symbol, f"qty={qty} @{limit_price}")
+    current_positions[symbol] = {"qty": qty}
+    return True
+
+
+def _india_try_sell(
+    *,
+    india_broker,
+    risk_mgr,
+    symbol: str,
+    current_positions: dict,
+) -> bool:
+    if symbol not in current_positions:
+        return False
+    pos = current_positions[symbol]
+    px = pos.get("current_price") or pos.get("avg_entry_price")
+    if india_broker.close_position(symbol):
+        trade_journal.record_exit("INDIA", symbol, float(px or 0), reason="signal_sell")
+        risk_mgr.clear_trade(symbol)
+        alerts.trade_alert("INDIA", "SELL", symbol, f"@{px}")
+        current_positions.pop(symbol, None)
+        return True
+    return False
+
+
 def is_india_market_open() -> bool:
     """Returns True if current time is between Mon-Fri 9:15 AM - 3:30 PM IST."""
     now_ist = datetime.now(IST)
@@ -298,89 +413,28 @@ def run_india_loop(strategy, risk_mgr, rs_filter=None):
                 atr = strategy.latest_atr(df)
 
                 if signal == "BUY":
-                    if not tradable_window:
-                        logger.info(f"{symbol}: BUY skipped — outside tradable session window")
-                        continue
-                    if not regime_ok:
-                        logger.info(f"{symbol}: BUY skipped — regime filter blocked entries")
-                        continue
-                    if not risk_mgr.is_position_allowed(symbol, current_positions):
-                        continue
-
-                    quote = india_broker.get_latest_quote(symbol)
-                    # Candle close already used for the signal — safe paper/live fallback
-                    # when Dhan marketfeed LTP is down / not subscribed.
-                    limit_price = None
-                    if quote and quote.get("ltp"):
-                        limit_price = float(quote["ltp"])
-                    elif snap.get("price"):
-                        limit_price = float(snap["price"])
-                        logger.warning(
-                            f"{symbol}: no live LTP — using signal candle close "
-                            f"{limit_price:.2f} for entry"
-                        )
-                    if limit_price is None or limit_price <= 0:
-                        logger.warning(f"{symbol}: BUY skipped — no usable price")
-                        continue
-
-                    sizing_equity = min(
-                        current_equity,
-                        float(account.get("available_cash") or current_equity),
-                    )
-
-                    sl = risk_mgr.get_stop_loss_price(limit_price, atr)
-                    tp = risk_mgr.get_take_profit_price(
-                        limit_price, stop_loss_price=sl, atr=atr
-                    )
-                    stop_dist = limit_price - sl
-                    qty = risk_mgr.calculate_position_size(
-                        sizing_equity, limit_price, stop_distance=stop_dist
-                    )
-                    if qty <= 0:
-                        logger.warning(
-                            f"{symbol}: BUY skipped — sized to 0 shares "
-                            f"(price={limit_price:.2f}, equity={sizing_equity:.0f})"
-                        )
-                        continue
-
-                    order_id = india_broker.place_buy_order(
+                    _india_try_buy(
+                        india_broker=india_broker,
+                        risk_mgr=risk_mgr,
+                        strategy=strategy,
                         symbol=symbol,
-                        qty=qty,
-                        limit_price=limit_price,
-                        stop_loss_price=sl,
-                        take_profit_price=tp,
+                        snap=snap,
                         atr=atr,
+                        current_equity=current_equity,
+                        account=account,
+                        current_positions=current_positions,
+                        tradable_window=tradable_window,
+                        regime_ok=regime_ok,
+                        reason="signal_buy",
                     )
-                    if not order_id:
-                        logger.warning(
-                            f"{symbol}: BUY order failed — "
-                            f"{getattr(india_broker, 'last_error', 'unknown')}"
-                        )
-                    if order_id:
-                        risk_mgr.register_trade(symbol, limit_price, sl, atr)
-                        trade_journal.record_entry(
-                            "INDIA",
-                            symbol,
-                            qty,
-                            limit_price,
-                            stop_price=sl,
-                            take_profit=tp,
-                            reason="signal_buy",
-                            strategy=strategy.name,
-                            meta={"atr": atr, "order_id": order_id},
-                        )
-                        alerts.trade_alert("INDIA", "BUY", symbol, f"qty={qty} @{limit_price}")
-                        current_positions[symbol] = {"qty": qty}
 
-                elif signal == "SELL" and symbol in current_positions:
-                    pos = current_positions[symbol]
-                    px = pos.get("current_price") or pos.get("avg_entry_price")
-                    if india_broker.close_position(symbol):
-                        trade_journal.record_exit(
-                            "INDIA", symbol, float(px), reason="signal_sell"
-                        )
-                        risk_mgr.clear_trade(symbol)
-                        alerts.trade_alert("INDIA", "SELL", symbol, f"@{px}")
+                elif signal == "SELL":
+                    _india_try_sell(
+                        india_broker=india_broker,
+                        risk_mgr=risk_mgr,
+                        symbol=symbol,
+                        current_positions=current_positions,
+                    )
 
             bot_state.publish_signals("INDIA", signal_rows)
             bot_state.mark_healthy("INDIA")
@@ -398,6 +452,202 @@ def run_india_loop(strategy, risk_mgr, rs_filter=None):
             bot_state.mark_cycle("INDIA", error=str(e))
             alerts.health_alert(f"INDIA loop error: {e}")
             time.sleep(config.INDIA_LOOP_INTERVAL_SEC)
+
+
+def run_india_scout_loop(strategy, risk_mgr, rs_filter=None):
+    """
+    Scout universe (~Nifty 50): trade-eligible on full BUY + same gates as core.
+    Also publishes Near Setups (close but not confirmed) for the dashboard.
+    Core INDIA_STOCK_UNIVERSE stays on Strategy Scanner / faster India loop.
+    Scout-only names get BUY here when INDIA_SCOUT_AUTO_BUY=true (default).
+    """
+    from india_client import get_shared_india_broker
+    from india_scout import (
+        rank_near_setups,
+        resolve_scout_universe,
+        score_near_setup,
+        scout_only_symbols,
+    )
+    from strategy import params_for_market
+
+    if not config.INDIA_SCOUT_ENABLED:
+        logger.info("[INDIA SCOUT] Disabled (INDIA_SCOUT_ENABLED=false)")
+        return
+
+    auto_buy = bool(config.INDIA_SCOUT_AUTO_BUY)
+    logger.info(
+        f"[INDIA SCOUT] Starting | auto_buy={auto_buy} | "
+        f"near-setups panel for close-but-not-confirmed"
+    )
+
+    try:
+        india_broker = get_shared_india_broker(auto_login=True)
+    except Exception as e:
+        logger.error(f"[INDIA SCOUT] Broker init failed: {e}")
+        bot_state.mark_cycle("INDIA_SCOUT", error=str(e))
+        return
+
+    params = params_for_market("INDIA")
+    universe = resolve_scout_universe()
+    core_set = {s.upper() for s in config.INDIA_STOCK_UNIVERSE}
+    scout_trade_set = {s for s in scout_only_symbols()}
+    gap = max(0.15, float(config.INDIA_SCOUT_FETCH_GAP_SEC))
+    interval = max(300, int(config.INDIA_SCOUT_INTERVAL_SEC))
+    paper = india_broker.paper is not None
+
+    rs_n = getattr(rs_filter, "top_n", None) if rs_filter else None
+    logger.info(
+        f"[INDIA SCOUT] Ready | universe={len(universe)} "
+        f"(scout-only tradeable={len(scout_trade_set)}, core={len(core_set)}) | "
+        f"interval={interval}s | near_top_n={config.INDIA_SCOUT_TOP_N} | "
+        f"rs_top_n={rs_n} | auto_buy={auto_buy} | Mode={'PAPER' if paper else 'LIVE'}"
+    )
+
+    while True:
+        try:
+            loop_start = time.time()
+            now_ist = datetime.now(IST)
+
+            if not is_india_market_open():
+                logger.info(
+                    f"[INDIA SCOUT] Market CLOSED ({now_ist.strftime('%A %I:%M %p IST')}). "
+                    f"Next check in {interval}s..."
+                )
+                time.sleep(interval)
+                continue
+
+            if not india_broker.is_logged_in:
+                india_broker.ensure_session()
+                if not india_broker.is_logged_in:
+                    logger.warning(
+                        f"[INDIA SCOUT] Not logged in ({india_broker.last_error}) — skip"
+                    )
+                    time.sleep(interval)
+                    continue
+
+            # Refresh caps / kill state via account (same risk surface as core)
+            account = india_broker.get_account_info()
+            if account is None:
+                logger.error("[INDIA SCOUT] No account info — skipping cycle")
+                time.sleep(interval)
+                continue
+
+            current_equity = account["equity"]
+            sod = account.get("last_equity")
+            if sod is None or sod <= 0:
+                sod = bot_state.india_sod_equity(current_equity)
+            else:
+                bot_state.india_sod_equity(sod)
+
+            if risk_mgr.check_daily_drawdown(current_equity, sod):
+                logger.critical("[INDIA SCOUT] Kill-switch (daily drawdown) — no entries")
+                time.sleep(interval)
+                continue
+            if risk_mgr.is_kill_switch_active:
+                logger.critical("[INDIA SCOUT] Kill-switch active — skipping entries")
+                time.sleep(interval)
+                continue
+
+            tradable_window = risk_mgr.is_tradable_session(
+                now_ist, market_open_hm=(9, 15), market_close_hm=(15, 30)
+            )
+            current_positions = india_broker.get_open_positions() or {}
+
+            bar_cache: dict = {}
+            scored: list = []
+            scanned = 0
+            skipped = 0
+            buys = 0
+            sells = 0
+
+            for i, symbol in enumerate(universe):
+                try:
+                    df = india_broker.get_historical_bars(symbol)
+                    if df is None or df.empty:
+                        skipped += 1
+                    else:
+                        df = strategy.compute_indicators(df)
+                        bar_cache[symbol] = df
+                        scored.append(score_near_setup(df, params, symbol=symbol))
+                        scanned += 1
+                except Exception as se:
+                    skipped += 1
+                    logger.debug(f"[INDIA SCOUT] {symbol}: {se}")
+                if i + 1 < len(universe):
+                    time.sleep(gap)
+
+            _refresh_rs_filter(rs_filter, bar_cache)
+            # Regime uses scout bars when available (RELIANCE usually present)
+            regime_ok = regime_allows("INDIA", bar_cache)
+
+            # Trade scout-only names on full signal; core 12 handled by India loop
+            for symbol in scout_trade_set:
+                df = bar_cache.get(symbol)
+                if df is None or df.empty:
+                    continue
+                snap = snapshot_signal(strategy, df, symbol)
+                signal = snap["signal"]
+                atr = strategy.latest_atr(df)
+
+                if signal == "BUY" and auto_buy:
+                    logger.info(f"[INDIA SCOUT] BUY candidate {symbol}")
+                    if _india_try_buy(
+                        india_broker=india_broker,
+                        risk_mgr=risk_mgr,
+                        strategy=strategy,
+                        symbol=symbol,
+                        snap=snap,
+                        atr=atr,
+                        current_equity=current_equity,
+                        account=account,
+                        current_positions=current_positions,
+                        tradable_window=tradable_window,
+                        regime_ok=regime_ok,
+                        reason="scout_signal_buy",
+                    ):
+                        buys += 1
+                elif signal == "SELL":
+                    if _india_try_sell(
+                        india_broker=india_broker,
+                        risk_mgr=risk_mgr,
+                        symbol=symbol,
+                        current_positions=current_positions,
+                    ):
+                        sells += 1
+
+            near = rank_near_setups(scored, exclude_confirmed=True)
+            meta = {
+                "scanned": scanned,
+                "skipped": skipped,
+                "universe_size": len(universe),
+                "scout_only_size": len(scout_trade_set),
+                "top_n": config.INDIA_SCOUT_TOP_N,
+                "min_score": config.INDIA_SCOUT_MIN_SCORE,
+                "auto_buy": auto_buy,
+                "buys": buys,
+                "sells": sells,
+                "trade_eligible": True,
+                "core_universe_size": len(core_set),
+            }
+            bot_state.publish_scout("INDIA", near, meta=meta)
+            bot_state.mark_healthy("INDIA_SCOUT")
+
+            preview = ", ".join(f"{r['symbol']}={r['score']}" for r in near[:5]) or "(none)"
+            elapsed = time.time() - loop_start
+            sleep_time = max(0, interval - elapsed)
+            logger.info(
+                f"[INDIA SCOUT] Cycle done ({elapsed:.1f}s) scanned={scanned} "
+                f"skipped={skipped} buys={buys} sells={sells} near={preview} | "
+                f"next in {sleep_time:.0f}s"
+            )
+            time.sleep(sleep_time)
+
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:
+            logger.error(f"[INDIA SCOUT ERROR] {e}", exc_info=True)
+            bot_state.mark_cycle("INDIA_SCOUT", error=str(e))
+            time.sleep(interval)
 
 
 def run_us_loop(strategy, risk_mgr, rs_filter=None):
@@ -715,6 +965,13 @@ def run_bot():
         if feed_mgr.enabled or getattr(feed_mgr, "_want_live", False):
             n = 0
             n += feed_mgr.subscribe_universe(config.INDIA_STOCK_UNIVERSE, "NSE_EQ")
+            if config.INDIA_SCOUT_ENABLED:
+                try:
+                    from india_scout import resolve_scout_universe
+
+                    n += feed_mgr.subscribe_universe(resolve_scout_universe(), "NSE_EQ")
+                except Exception as se:
+                    logger.warning(f"[FEED] Scout universe subscribe warning: {se}")
             if config.INDIA_FNO_ENABLED:
                 n += feed_mgr.subscribe_universe(config.INDIA_FNO_UNIVERSE, "NSE_FNO")
             if config.MCX_ENABLED:
@@ -784,6 +1041,28 @@ def run_bot():
         logger.info(
             f"[INDIA] Background loop started ({config.INDIA_BROKER} + paper/live)"
         )
+        if config.INDIA_SCOUT_ENABLED:
+            scout_rs = (
+                RelativeStrengthFilter(top_n=config.INDIA_SCOUT_RS_TOP_N)
+                if config.USE_RELATIVE_STRENGTH
+                else None
+            )
+            scout_strategy = create_strategy("INDIA", rs_filter=scout_rs)
+            scout_thread = threading.Thread(
+                target=run_india_scout_loop,
+                args=(scout_strategy, india_risk, scout_rs),
+                daemon=True,
+                name="IndiaScoutLoop",
+            )
+            scout_thread.start()
+            logger.info(
+                f"[INDIA SCOUT] Background loop started "
+                f"(interval={config.INDIA_SCOUT_INTERVAL_SEC}s, "
+                f"rs_top_n={config.INDIA_SCOUT_RS_TOP_N}, "
+                f"auto_buy={config.INDIA_SCOUT_AUTO_BUY})"
+            )
+        else:
+            logger.info("[INDIA SCOUT] Skipped (INDIA_SCOUT_ENABLED=false)")
     else:
         logger.warning(
             "[INDIA] Disabled — missing Dhan/Angel credentials "

@@ -114,12 +114,46 @@ INDIA_STOCK_UNIVERSE: list[str] = [
     if s.strip()
 ]
 
+# India scout universe (~Nifty 50 liquid names) — TRADE-ELIGIBLE.
+# Core INDIA_STOCK_UNIVERSE stays on Strategy Scanner (faster loop).
+# Scout auto-buys on full trend_pullback + risk/session/regime/RS gates.
+# Near-setups panel shows close-but-not-confirmed names only.
+INDIA_SCOUT_ENABLED: bool = _env_bool("INDIA_SCOUT_ENABLED", "true")
+_INDIA_SCOUT_UNIVERSE_RAW = os.getenv("INDIA_SCOUT_UNIVERSE", "").strip()
+INDIA_SCOUT_UNIVERSE: list[str] = (
+    [s.strip().upper() for s in _INDIA_SCOUT_UNIVERSE_RAW.split(",") if s.strip()]
+    if _INDIA_SCOUT_UNIVERSE_RAW
+    else []  # empty → india_scout.DEFAULT_INDIA_SCOUT_UNIVERSE
+)
+INDIA_SCOUT_INTERVAL_SEC: int = _env_int("INDIA_SCOUT_INTERVAL_SEC", "600")  # 10 min
+INDIA_SCOUT_TOP_N: int = _env_int("INDIA_SCOUT_TOP_N", "10")
+INDIA_SCOUT_MIN_SCORE: float = _env_float("INDIA_SCOUT_MIN_SCORE", "35")
+INDIA_SCOUT_FETCH_GAP_SEC: float = _env_float("INDIA_SCOUT_FETCH_GAP_SEC", "0.4")
+# RS gate for scout loop only (core India loop still uses RS_TOP_N). Wider list → higher N.
+INDIA_SCOUT_RS_TOP_N: int = _env_int("INDIA_SCOUT_RS_TOP_N", "10")
+# Auto-buy scout-only names on full BUY signal (default ON). Core 12 still traded by India loop.
+INDIA_SCOUT_AUTO_BUY: bool = _env_bool("INDIA_SCOUT_AUTO_BUY", "true")
+# Deprecated alias — prefer INDIA_SCOUT_AUTO_BUY
+INDIA_SCOUT_AUTO_PROMOTE: bool = _env_bool("INDIA_SCOUT_AUTO_PROMOTE", "false")
+
 INDIA_CORRELATION_CLUSTERS: dict[str, list[str]] = {
-    "in_it": ["TCS", "INFY", "WIPRO"],
-    "in_banks": ["HDFCBANK", "ICICIBANK", "SBIN", "KOTAKBANK"],
-    "in_energy": ["RELIANCE"],
-    "in_fmcg": ["HINDUNILVR", "ITC"],
-    "in_infra": ["LT", "BHARTIARTL"],
+    "in_it": ["TCS", "INFY", "WIPRO", "HCLTECH", "TECHM"],
+    "in_banks": [
+        "HDFCBANK",
+        "ICICIBANK",
+        "SBIN",
+        "KOTAKBANK",
+        "AXISBANK",
+        "INDUSINDBK",
+    ],
+    "in_energy": ["RELIANCE", "ONGC", "BPCL", "COALINDIA", "NTPC", "POWERGRID"],
+    "in_fmcg": ["HINDUNILVR", "ITC", "NESTLEIND", "BRITANNIA", "TATACONSUM"],
+    "in_infra": ["LT", "BHARTIARTL", "ADANIPORTS", "ULTRACEMCO"],
+    "in_auto": ["MARUTI", "TATAMOTORS", "M&M", "EICHERMOT", "HEROMOTOCO", "BAJAJ-AUTO"],
+    "in_pharma": ["SUNPHARMA", "CIPLA", "DRREDDY", "DIVISLAB", "APOLLOHOSP"],
+    "in_metals": ["TATASTEEL", "JSWSTEEL", "HINDALCO"],
+    "in_finance": ["BAJFINANCE", "BAJAJFINSV", "HDFCLIFE", "SBILIFE"],
+    "in_consumer": ["ASIANPAINT", "TITAN", "TRENT", "BEL", "ADANIENT", "GRASIM"],
 }
 
 # ===========================================================================
