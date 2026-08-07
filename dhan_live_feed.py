@@ -27,7 +27,7 @@ _feed_lock = threading.Lock()
 # Dhan allows few concurrent MarketFeed sockets per client; 429 means back off hard.
 _FEED_BACKOFF_START_SEC = 5.0
 _FEED_BACKOFF_MAX_SEC = 300.0  # 5 minutes
-_FEED_429_BACKOFF_SEC = 60.0
+_FEED_429_BACKOFF_SEC = 120.0  # 2 minutes minimum after 429
 _FEED_429_BACKOFF_MAX_SEC = 600.0  # 10 minutes
 _RECONNECT_DEBOUNCE_SEC = 45.0
 
@@ -97,6 +97,10 @@ class DhanLiveFeedManager:
 
         self._is_connected = False
         self._last_heartbeat = 0.0
+        self._last_recv_at = 0.0
+        self._diag_frames = 0
+        self._last_error = ""
+        self._run_error: BaseException | None = None
         self._lock = threading.Lock()
         self._stop = False
 
@@ -184,19 +188,42 @@ class DhanLiveFeedManager:
         if ws is None:
             return
         logger.info(f"[FEED] Force reconnect ({reason})")
-        for method_name in ("close", "disconnect", "stop", "logout"):
+        self._close_ws(ws)
+
+    @staticmethod
+    def _close_ws(ws) -> None:
+        for method_name in ("close_connection", "disconnect", "close", "stop", "logout"):
             method = getattr(ws, method_name, None)
-            if callable(method):
-                try:
-                    method()
-                    return
-                except Exception as e:
-                    logger.debug(f"[FEED] {method_name} during reconnect: {e}")
+            if not callable(method):
+                continue
+            try:
+                method()
+                return
+            except Exception as e:
+                logger.debug(f"[FEED] {method_name} during close: {e}")
 
     @staticmethod
     def _is_rate_limit_error(err: BaseException | str) -> bool:
         msg = str(err).lower()
-        return "429" in msg or "too many requests" in msg or "rate limit" in msg
+        return (
+            "429" in msg
+            or "too many requests" in msg
+            or "rate limit" in msg
+            or "connection limit" in msg
+            or "rejected websocket" in msg
+            or "805" in msg
+        )
+
+    def _arm_rate_limit(self, backoff: float, reason: str) -> None:
+        backoff = min(max(backoff, _FEED_429_BACKOFF_SEC), _FEED_429_BACKOFF_MAX_SEC)
+        with self._lock:
+            self._rate_limited_until = max(
+                self._rate_limited_until, time.time() + backoff
+            )
+            self._last_error = reason
+        logger.warning(
+            f"[FEED] MarketFeed rate-limited — cool-down {backoff:.0f}s ({reason})"
+        )
 
     def _start_threads(self):
         if self._feed_thread is not None and self._feed_thread.is_alive():
@@ -211,13 +238,67 @@ class DhanLiveFeedManager:
             )
             self._order_thread.start()
 
+    def _on_ticks_callback(self, ws_or_data, data=None):
+        """
+        MarketFeed on_message/on_ticks signature is (ws, data) when using run().
+        Also accept a bare dict for tests / older call sites.
+        """
+        payload = data if data is not None else ws_or_data
+        with self._lock:
+            self._last_recv_at = time.time()
+            self._diag_frames += 1
+            frame_n = self._diag_frames
+
+        if frame_n <= 8:
+            if isinstance(payload, dict):
+                logger.info(
+                    f"[FEED] frame#{frame_n}: type={payload.get('type')} "
+                    f"sec={payload.get('security_id')} LTP={payload.get('LTP')}"
+                )
+            else:
+                logger.info(f"[FEED] frame#{frame_n}: {type(payload).__name__}={payload!r}"[:200])
+        elif frame_n == 9:
+            logger.info("[FEED] Tick stream healthy — further frame dumps at DEBUG")
+
+        if isinstance(payload, list):
+            for item in payload:
+                self._on_tick(item)
+        else:
+            self._on_tick(payload)
+
+    def _on_ws_error(self, _ws, err):
+        self._run_error = err if isinstance(err, BaseException) else Exception(str(err))
+        self._last_error = str(err)
+        if self._is_rate_limit_error(err):
+            self._arm_rate_limit(_FEED_429_BACKOFF_SEC, str(err))
+            ws = self._ws_feed
+            if ws is not None:
+                self._close_ws(ws)
+        else:
+            logger.warning(f"[FEED] MarketFeed WS error: {err}")
+
     def _on_tick(self, data):
         if not isinstance(data, dict):
+            # Market status sometimes returns a plain string
+            if isinstance(data, str) and data:
+                with self._lock:
+                    self._last_recv_at = time.time()
+                    self._is_connected = True
             return
         sec_id = str(data.get("security_id") or data.get("securityId") or "")
         with self._lock:
-            sym = data.get("symbol") or self._sec_id_to_symbol.get(sec_id) or sec_id
-        ltp = float(data.get("LTP") or data.get("last_price") or data.get("close") or 0.0)
+            sym = data.get("symbol") or self._sec_id_to_symbol.get(sec_id) or ""
+            self._last_recv_at = time.time()
+            self._is_connected = True
+        if not sym:
+            # Keep sec_id as fallback label only when we have LTP
+            sym = sec_id
+        try:
+            ltp = float(
+                data.get("LTP") or data.get("last_price") or data.get("close") or 0.0
+            )
+        except (TypeError, ValueError):
+            ltp = 0.0
         if sym and ltp > 0:
             self.update_quote(
                 symbol=sym,
@@ -227,7 +308,7 @@ class DhanLiveFeedManager:
                 low=float(data.get("low", 0.0) or 0.0),
                 close=float(data.get("close", 0.0) or 0.0),
                 volume=int(data.get("volume", 0) or 0),
-                oi=int(data.get("oi", 0) or 0),
+                oi=int(data.get("oi", 0) or data.get("OI", 0) or 0),
             )
 
     def _snapshot_instruments(self) -> list:
@@ -277,30 +358,58 @@ class DhanLiveFeedManager:
 
                 ctx = DhanContext(cid, tok)
                 instruments = self._snapshot_instruments()
+                self._diag_frames = 0
+                self._run_error = None
                 self._ws_feed = MarketFeed(
                     ctx,
                     instruments=instruments,
                     version="v2",
-                    on_ticks=self._on_tick,
+                    on_ticks=self._on_ticks_callback,
+                    on_error=self._on_ws_error,
                 )
                 logger.info(
                     f"[FEED] MarketFeed connecting with {len(instruments)} instrument(s)..."
                 )
                 hb_before = self._last_heartbeat
-                if hasattr(self._ws_feed, "run_forever"):
+
+                # Prefer run() so the asyncio loop + websocket keepalive stay alive.
+                # run_forever() only connects then returns → instant "disconnect" storm.
+                if hasattr(self._ws_feed, "run"):
+                    logger.info("[FEED] MarketFeed run() — receiving ticks")
+                    self._ws_feed.run()
+                elif hasattr(self._ws_feed, "run_forever"):
                     self._ws_feed.run_forever()
-                elif hasattr(self._ws_feed, "connect"):
-                    self._ws_feed.connect()
+                    while not self._stop:
+                        with self._lock:
+                            if time.time() < self._rate_limited_until:
+                                was_rate_limited = True
+                                break
+                        try:
+                            data = self._ws_feed.get_data()
+                            self._on_ticks_callback(self._ws_feed, data)
+                        except Exception as recv_err:
+                            if self._is_rate_limit_error(recv_err):
+                                was_rate_limited = True
+                                raise
+                            logger.warning(
+                                f"[FEED] MarketFeed recv ended: {recv_err}"
+                            )
+                            break
                 else:
-                    logger.error("[FEED] MarketFeed has no run_forever/connect")
+                    logger.error("[FEED] MarketFeed has no run/run_forever")
                     break
+
+                if self._run_error and self._is_rate_limit_error(self._run_error):
+                    was_rate_limited = True
+                    raise self._run_error
+
                 had_ticks = self._last_heartbeat > hb_before
-                # run_forever returned → disconnected
                 logger.warning("[FEED] MarketFeed disconnected — scheduling reconnect")
                 if had_ticks:
                     backoff = _FEED_BACKOFF_START_SEC
                     self._reconnect_attempts = 0
             except Exception as wse:
+                self._last_error = str(wse)
                 if self._is_rate_limit_error(wse):
                     was_rate_limited = True
                     backoff = max(backoff, _FEED_429_BACKOFF_SEC)
@@ -318,7 +427,10 @@ class DhanLiveFeedManager:
             finally:
                 with self._lock:
                     self._is_connected = False
+                    ws = self._ws_feed
                     self._ws_feed = None
+                if ws is not None:
+                    self._close_ws(ws)
                 self._reconnect_attempts += 1
                 try:
                     self._connect_lock.release()
@@ -517,8 +629,13 @@ class DhanLiveFeedManager:
         with self._lock:
             if not self.enabled:
                 return False
-            # Truly connected if heartbeat received within 60 seconds
-            return self._is_connected and (time.time() - self._last_heartbeat < 60.0)
+            now = time.time()
+            # Quote heartbeat preferred; recent frame also counts (status packets)
+            if self._last_heartbeat > 0 and (now - self._last_heartbeat < 60.0):
+                return True
+            if self._last_recv_at > 0 and (now - self._last_recv_at < 90.0):
+                return True
+            return False
 
     def status_summary(self) -> dict:
         connected = self.is_connected()
@@ -526,25 +643,42 @@ class DhanLiveFeedManager:
             heartbeat_age = (
                 round(time.time() - self._last_heartbeat, 1) if self._last_heartbeat > 0 else None
             )
+            rate_left = (
+                round(max(0.0, self._rate_limited_until - time.time()), 1)
+                if self._rate_limited_until > time.time()
+                else 0
+            )
             return {
                 "enabled": self.enabled,
                 "connected": connected,
-                "mode": "websocket_live" if connected else (
-                    "waiting_token" if self._want_live and not self.access_token
-                    else ("reconnect" if self.enabled else "rest_fallback")
+                "mode": (
+                    "websocket_live"
+                    if connected and self._last_heartbeat > 0
+                    else (
+                        "websocket_connected"
+                        if connected
+                        else (
+                            "rate_limited"
+                            if rate_left > 0
+                            else (
+                                "waiting_token"
+                                if self._want_live and not self.access_token
+                                else (
+                                    "reconnect" if self.enabled else "rest_fallback"
+                                )
+                            )
+                        )
+                    )
                 ),
                 "has_access_token": bool(self.access_token),
-                "rate_limited_for_sec": (
-                    round(max(0.0, self._rate_limited_until - time.time()), 1)
-                    if self._rate_limited_until > time.time()
-                    else 0
-                ),
+                "rate_limited_for_sec": rate_left,
                 "cached_symbols_count": len(self._quote_cache),
                 "subscribed_count": len(self._subscribed_symbols),
                 "instrument_tuples_count": len(self._instrument_tuples),
                 "last_heartbeat_age_sec": heartbeat_age,
                 "order_updates_received": len(self._order_updates),
                 "reconnect_attempts": self._reconnect_attempts,
+                "last_error": self._last_error or None,
                 "us_feed_note": (
                     "US Global uses separate GlobalStocksFeed "
                     "(see dhan_us_live_feed / DHAN_US_LIVE_WEBSOCKET)"

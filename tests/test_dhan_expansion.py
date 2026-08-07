@@ -94,11 +94,23 @@ class TestDhanExpansionProductionSuite(unittest.TestCase):
         feed = DhanLiveFeedManager()
         feed.enabled = True
         feed._last_heartbeat = 0.0
+        feed._last_recv_at = 0.0
         feed._is_connected = False
         self.assertFalse(feed.is_connected())
 
         feed.update_quote("RELIANCE", 2500.0)
         self.assertTrue(feed.is_connected())
+
+        # MarketFeed.run() calls on_ticks(ws, data) — two-arg callback must accept that
+        feed._on_ticks_callback(MagicMock(), {
+            "type": "Quote Data",
+            "security_id": "2885",
+            "LTP": "2501.50",
+            "symbol": "RELIANCE",
+        })
+        q = feed.get_live_quote("RELIANCE")
+        self.assertIsNotNone(q)
+        self.assertAlmostEqual(float(q["ltp"]), 2501.50, places=1)
 
         feed._ws_feed = MagicMock()
         feed._ws_feed.subscribe_symbols = MagicMock()
@@ -119,6 +131,11 @@ class TestDhanExpansionProductionSuite(unittest.TestCase):
         self.assertIn("subscribed_count", summary)
         self.assertIn("order_updates_received", summary)
         self.assertIn("mode", summary)
+        self.assertTrue(
+            DhanLiveFeedManager._is_rate_limit_error(
+                "server rejected WebSocket connection: HTTP 429"
+            )
+        )
 
         # Paid Data API: broker-refreshed token must update feed credentials
         feed.update_credentials("1112996229", "fresh-token-xyz", reconnect=False)

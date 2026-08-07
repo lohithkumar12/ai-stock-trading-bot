@@ -44,7 +44,7 @@ _feed_lock = threading.Lock()
 
 _FEED_BACKOFF_START_SEC = 5.0
 _FEED_BACKOFF_MAX_SEC = 300.0
-_FEED_429_BACKOFF_SEC = 60.0
+_FEED_429_BACKOFF_SEC = 120.0
 _FEED_429_BACKOFF_MAX_SEC = 600.0
 _RECONNECT_DEBOUNCE_SEC = 45.0
 
@@ -444,6 +444,7 @@ class DhanUSLiveFeedManager:
             or "too many requests" in msg
             or "rate limit" in msg
             or "connection limit" in msg
+            or "rejected websocket" in msg
             or "805" in msg
         )
 
